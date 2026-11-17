@@ -1,0 +1,263 @@
+{
+  "device": {
+    "adb": "D:\\Program Files\\Netease\\MuMu Player 12\\shell\\adb.exe",
+    "serial": "127.0.0.1:16384",
+    "package": "com.wjmtjq.ma.android",
+    "activity": "com.hnyl.core.fragment.AgreementSplashActivity"
+  },
+  "emulator": {
+    "manager": "D:\\Program Files\\Netease\\MuMu Player 12\\nx_main\\MuMuManager.exe",
+    "vm": "0",
+    "start": true
+  },
+  "runtime": {
+    "screenshot_dir": "logs/screens",
+    "state_file": "logs/state.json",
+    "tap_ms": 220,
+    "keep_screenshots": 300,
+    "max_task_minutes": 15,
+    "allow_diamonds": false,
+    "task_retries": 1,
+    "auto_recover": true
+  },
+  "limits": {
+    "diamond_budget": 800,
+    "gold_keep": 50000
+  },
+  "tasks": {
+    "tower": {
+      "enabled": true,
+      "priority": 10,
+      "params": {
+        "max_wins": 100,
+        "max_lose": 10
+      }
+    },
+    "legend": {
+      "enabled": true,
+      "priority": 20,
+      "params": {
+        "max_fights": 8
+      }
+    },
+    "tree": {
+      "enabled": true,
+      "priority": 30,
+      "params": {
+        "max_stages": 12,
+        "max_lose": 10,
+        "star_fights": 3
+      }
+    },
+    "demon": {
+      "enabled": true,
+      "priority": 40,
+      "params": {
+        "max_buff_picks": 40
+      }
+    },
+    "dragon": {
+      "enabled": true,
+      "priority": 41,
+      "params": {
+        "max_fights": 6,
+        "max_lose": 2
+      }
+    },
+    "faction": {
+      "enabled": true,
+      "priority": 42,
+      "params": {
+        "max_runs": 1
+      }
+    },
+    "dungeon": {
+      "enabled": true,
+      "priority": 43,
+      "params": {
+        "max_push": 3,
+        "sweeps": 6
+      }
+    },
+    "soul": {
+      "enabled": true,
+      "priority": 44,
+      "params": {
+        "max_nodes": 10
+      }
+    },
+    "goblin": {
+      "enabled": true,
+      "priority": 82,
+      "params": {
+        "max_occupy": 3,
+        "layers": 10
+      }
+    },
+    "guild_trial": {
+      "enabled": true,
+      "priority": 78,
+      "params": {
+        "times": 3,
+        "buy_attempt": true,
+        "buy_cost": 20
+      }
+    },
+    "beast": {
+      "enabled": true,
+      "priority": 81,
+      "params": {
+        "times": 5
+      }
+    },
+    "campaign": {
+      "enabled": true,
+      "priority": 80,
+      "params": {
+        "max_fights": 30
+      }
+    },
+    "mail": {
+      "enabled": true,
+      "priority": 1,
+      "params": {}
+    },
+    "rank": {
+      "enabled": true,
+      "priority": 2,
+      "params": {}
+    },
+    "friend": {
+      "enabled": true,
+      "priority": 3,
+      "params": {}
+    },
+    "welfare": {
+      "enabled": true,
+      "priority": 4,
+      "params": {}
+    },
+    "claim": {
+      "enabled": true,
+      "priority": 5,
+      "params": {}
+    },
+    "rank_board": {
+      "enabled": true,
+      "priority": 6,
+      "params": {
+        "max_rows": 5
+      }
+    },
+    "bp": {
+      "enabled": true,
+      "priority": 7,
+      "params": {}
+    },
+    "bounty": {
+      "enabled": true,
+      "priority": 79,
+      "params": {
+        "times": 3,
+        "max_refreshes": 1
+      }
+    },
+    "merchant": {
+      "enabled": true,
+      "priority": 15,
+      "params": {
+        "min_discount": 100,
+        "max_bargains": 20,
+        "item_index": 0,
+        "cancel_only": true,
+        "timeout_sec": 180
+      }
+    },
+    "idle": {
+      "enabled": true,
+      "priority": 70,
+      "params": {
+        "times": 3,
+        "diamond_budget": 150
+      }
+    },
+    "shop": {
+      "enabled": true,
+      "priority": 76,
+      "params": {
+        "times": 2
+      }
+    },
+    "donate": {
+      "enabled": true,
+      "priority": 77,
+      "params": {}
+    },
+    "relic": {
+      "enabled": true,
+      "priority": 8,
+      "params": {}
+    },
+    "star": {
+      "enabled": true,
+      "priority": 9,
+      "params": {}
+    },
+    "equipment": {
+      "enabled": true,
+      "priority": 11,
+      "params": {}
+    },
+    "glory_book": {
+      "enabled": true,
+      "priority": 12,
+      "params": {}
+    },
+    "inherit": {
+      "enabled": true,
+      "priority": 13,
+      "params": {}
+    },
+    "artifact": {
+      "enabled": true,
+      "priority": 14,
+      "params": {
+        "star": true
+      }
+    },
+    "pet": {
+      "enabled": true,
+      "priority": 15,
+      "params": {}
+    },
+    "assist_mark": {
+      "enabled": true,
+      "priority": 16,
+      "params": {
+        "times": 10
+      }
+    },
+    "collection": {
+      "enabled": true,
+      "priority": 18,
+      "params": {}
+    },
+    "hero_bond": {
+      "enabled": true,
+      "priority": 19,
+      "params": {}
+    },
+    "hero_level": {
+      "enabled": true,
+      "priority": 13,
+      "params": {}
+    },
+    "forge": {
+      "enabled": true,
+      "priority": 75,
+      "params": {
+        "times": 1
+      }
+    }
+  }
+}

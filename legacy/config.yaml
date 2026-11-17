@@ -1,0 +1,38 @@
+# 手游自动化脚本配置
+
+device:
+  # 留空自动查找 adb（PATH / 常见安装目录 / bin/platform-tools）
+  # 也可以用 python tools/get_adb.py 下载到 bin/ 目录
+  adb: ""
+  # 多设备时填序列号（adb devices 第一列）
+  serial: ""
+  package: "com.wjmtjq1.ma.android"
+  # 没有设备时依次尝试连接（模拟器 adb 端口）
+  # MuMu12: 127.0.0.1:16384 / LDPlayer: 127.0.0.1:5555 / Nox: 127.0.0.1:62001
+  connect: []
+
+vision:
+  # 模板匹配阈值，越高越严格。找不到就适当降低（0.80 左右）
+  threshold: 0.86
+  # 单步默认等待秒数
+  timeout: 20
+  # 轮询间隔
+  poll_interval: 0.4
+  # 转灰度匹配会快一些，但彩色界面容易误判，默认关闭
+  grayscale: false
+  # 缩放搜索系数。裁剪模板时会写入参考分辨率，这里是在参考比例附近微调
+  scales: [0.94, 0.97, 1.0, 1.03, 1.06]
+
+runtime:
+  # 每次点击后的固定等待
+  tap_delay: 0.35
+  # 等待时间的随机浮动比例（0.15 表示 ±15%），避免操作过于机械
+  jitter: 0.15
+  # 循环默认最长运行分钟数，防止死循环
+  loop_max_minutes: 60
+  # 任务出错时保存当前画面，便于排查
+  screenshot_on_error: true
+
+paths:
+  templates: "templates"
+  logs: "logs"

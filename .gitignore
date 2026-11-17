@@ -1,0 +1,15 @@
+# runtime output (never committed)
+artifacts/
+archive/
+logs/
+snapshots/
+bin/
+
+# python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local config backups
+config.json.bak_*
+*.bak_2*

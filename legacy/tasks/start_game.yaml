@@ -1,0 +1,12 @@
+name: 启动游戏并等待主界面
+description: 打开游戏，等到主界面标志出现。先把 templates/main/home.png 截好
+steps:
+  - action: launch
+    wait: 8
+  - action: wait_template
+    template: main/home.png
+    timeout: 120
+  - action: screenshot
+    name: home
+  - action: log
+    message: "已进入主界面"

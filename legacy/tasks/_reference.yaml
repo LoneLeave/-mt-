@@ -1,0 +1,86 @@
+# 动作速查表（本文件不会被执行，steps 为空）
+#
+# 所有坐标都基于截图分辨率。x/y 写成整数是像素坐标，写成 0~1 的小数是相对坐标。
+# 所有字符串支持 {变量} 占位，变量来自任务 vars、set 步骤或 call 传入。
+#
+# 通用可选字段：
+#   timeout     等待秒数（wait_* / click_* 默认取 config.vision.timeout）
+#   threshold   本步的匹配阈值，覆盖 config
+#   region      [x, y, w, h]，只看屏幕某一块，能明显提速并减少误判
+#   required    click_* 找不到时是否报错，默认 true
+#   offset      [dx, dy] 点击中心点的偏移
+#   tap_delay   点击后的等待秒数
+#
+# - action: launch          启动应用，package 可省略（用 config 里的）
+#   wait: 8
+#
+# - action: stop            强制停止应用
+#
+# - action: sleep           等待，seconds 可以是数字或 [最小, 最大]
+#   seconds: [1.5, 3.0]
+#
+# - action: wait_template   等待某个模板出现
+#   template: main/home.png
+#   timeout: 60
+#
+# - action: wait_any        等待一组模板中的任意一个
+#   templates: [battle/win.png, battle/lose.png]
+#   save_as: result         # 命中后把模板名（不含扩展名）存进变量
+#
+# - action: click_template  找到并点击单个模板
+#   template: main/battle_entry.png
+#   timeout: 15
+#   offset: [0, 5]
+#   long_press_ms: 800      # 可选，长按
+#
+# - action: click_any       点击一组模板中最先找到的
+#   templates: [popup/close.png, popup/ok.png]
+#
+# - action: assert_template 断言界面上必须有某模板，没有就失败
+#   template: battle/result.png
+#
+# - action: break_if_template   找到就跳出当前 loop
+#   template: battle/no_stamina.png
+#
+# - action: break_if_any
+#   templates: [battle/no_stamina.png, popup/disconnect.png]
+#
+# - action: click_xy        直接点坐标
+#   x: 540
+#   y: 1600
+#
+# - action: swipe           滑动，times 可连续滑多次
+#   from: [0.5, 0.75]
+#   to: [0.5, 0.35]
+#   duration_ms: 400
+#   times: 1
+#
+# - action: back
+# - action: keyevent
+#   key: 4                  # 4=返回 3=Home 187=最近任务
+#
+# - action: screenshot      保存当前画面到 logs/shots/<name>.png
+#   name: home
+#
+# - action: loop            循环执行子步骤；times 为 0 表示一直循环
+#   times: 0
+#   max_minutes: 60         # 时间上限，防止卡死
+#   interval: 0.5           # 每轮结束后的等待
+#   steps:
+#     - action: click_any
+#       templates: [a.png, b.png]
+#       required: false
+#
+# - action: call            调用另一个任务文件，路径相对当前任务
+#   task: sub/check_popup.yaml
+#   vars:
+#     page: 2
+#
+# - action: set             设置变量
+#   vars:
+#     page: 2
+#
+# - action: log
+#   message: "当前第 {page} 页"
+
+steps: []

@@ -1,0 +1,14 @@
+name: 冒烟测试（不需要模板）
+description: 启动游戏、等一会、截图、返回，用来验证 adb、分辨率和截图链路
+steps:
+  - action: launch
+    wait: 6
+  - action: screenshot
+    name: smoke_home
+  - action: sleep
+    seconds: 1
+  - action: back
+  - action: sleep
+    seconds: 1
+  - action: log
+    message: "冒烟测试完成，检查 logs/shots/smoke_home.png"

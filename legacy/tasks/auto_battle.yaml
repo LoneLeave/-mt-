@@ -1,0 +1,51 @@
+name: 自动战斗（示例）
+description: 主界面 → 进入战斗 → 循环"结算/再来一次"。模板名要按你的实际界面替换
+# 需要准备这些模板（截图后用 tools/crop_tool.py 裁剪）：
+#   main/home.png            主界面标志（比如"战斗"按钮或顶部资源栏）
+#   main/battle_entry.png    战斗入口按钮
+#   battle/start.png         "开始战斗/挑战"按钮
+#   battle/win_ok.png        胜利结算的"确定/继续"
+#   battle/lose_ok.png       失败结算的"确定/继续"
+#   battle/again.png         "再来一次/再次挑战"
+#   battle/no_stamina.png    体力不足提示
+steps:
+  - action: wait_template
+    template: main/home.png
+    timeout: 120
+
+  - action: click_template
+    template: main/battle_entry.png
+    timeout: 15
+
+  - action: wait_template
+    template: battle/start.png
+    timeout: 30
+  - action: click_template
+    template: battle/start.png
+
+  - action: loop
+    times: 0            # 0 = 一直循环，靠 break 或时间上限退出
+    max_minutes: 120
+    steps:
+      - action: wait_any
+        templates: [battle/win_ok.png, battle/lose_ok.png, battle/again.png, battle/no_stamina.png]
+        timeout: 300
+        save_as: last_result
+
+      - action: break_if_any
+        templates: [battle/no_stamina.png]
+
+      - action: click_any
+        templates: [battle/win_ok.png, battle/lose_ok.png, battle/again.png]
+        timeout: 10
+
+      - action: sleep
+        seconds: [1.5, 3.0]
+
+      - action: click_template
+        template: battle/start.png
+        timeout: 5
+        required: false
+
+  - action: screenshot
+    name: battle_end
