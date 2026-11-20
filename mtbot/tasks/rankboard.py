@@ -115,10 +115,12 @@ class RankBoardTask(BaseTask):
         一次再切，只有二次仍失败才认输。
         """
         cur = ui.screen("rank_tabs")
+        # 2026-11-20 审计 MAJOR：旧码靠「页签处亮度 > 160」猜当前页签，猜错就不点了，
+        # 后面的领取全建立在错页上。页签点击本身幂等（点已选中的页签只是闪一下），
+        # 所以一律点，用 expect="none" 免掉空点噪声；亮度只留作日志参考。
         if vision.avg(cur, gx, gy, 20)[0] > 160:
-            log.info(f"  排行榜：分类 ({gx},{gy}) 已是当前页签，跳过点击")
-        else:
-            ui.press((gx, gy), 220, label=f"rank_tab:{gx}", expect="none")
+            log.info(f"  排行榜：分类 ({gx},{gy}) 看起来已是当前页签，仍点一次确认")
+        ui.press((gx, gy), 220, label=f"rank_tab:{gx}", expect="none")
         ui.wait(1.4)
         if self._await_list(ui, page):
             return True

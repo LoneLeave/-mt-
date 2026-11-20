@@ -33,6 +33,17 @@ class TowerTask(BaseTask):
             return 0
         return sum(1 for t, _c, _bb, _s in lines if "未达成" in t)
 
+    @staticmethod
+    def _progress_claimed(im) -> int:
+        """进度面板里写着「已领取」的行数（和「未达成」一起说明「没得领」的真因）。"""
+        if not textocr.available():
+            return 0
+        try:
+            lines = textocr.read_lines(im, L.TOWER_FRAME_BOX, min_score=0.6)
+        except Exception:  # noqa: BLE001
+            return 0
+        return sum(1 for t, _c, _bb, _s in lines if "已领取" in t)
+
     def _claim_rewards(self, ui) -> int:
         """塔页的「进度奖励」+「每日奖励」（2026-10-30 实测）。
 
@@ -50,6 +61,7 @@ class TowerTask(BaseTask):
                     target = y
                     break
             if target is None:
+                first = im
                 ui.dev.swipe(360, 950, 360, 650, 400)   # 往下翻里程碑
                 ui.wait(0.9)
                 im = ui.screen("tower_prog2")
@@ -60,10 +72,14 @@ class TowerTask(BaseTask):
                 if target is None:
                     # 真帧里四行都写着「通关…999/1010层 未达成」→ 没得领是里程碑没到，
                     # 不是脚本没翻到（2026-11-08 09:53 tests/fixtures/tower_prog_page.png）。
-                    done = self._progress_undone(im)
-                    if done:
-                        log.info(f"  塔进度奖励：{done} 条里程碑都还没达成（列表写「未达成」），"
-                                 f"没有可领的（已领 {n} 个）")
+                    # 2026-11-18 第 49 轮：只读滑动后那一帧，OCR 偶尔把「未达成」扫没了
+                    # （滑动中抓帧）→ 明明没得领却报 WARN。现在两帧都看，且把
+                    # 「已领取」也算作「没得领」的真因。
+                    done = max(self._progress_undone(first), self._progress_undone(im))
+                    claimed = max(self._progress_claimed(first), self._progress_claimed(im))
+                    if done or claimed:
+                        log.info(f"  塔进度奖励：里程碑 {done} 条未达成、{claimed} 条已领取，"
+                                 f"没有可领的（本次已领 {n} 个）")
                     else:
                         log.warn(f"  塔进度奖励：翻到底仍没找到金色「领取」（x={L.TOWER_CLAIM_X}，"
                                  f"候选 y={L.TOWER_CLAIM_YS}），已领 {n} 个")
@@ -88,38 +104,65 @@ class TowerTask(BaseTask):
         ui.press(L.TOWER_PROG_CLOSE, 200, expect="none")
         ui.wait(1.0)
 
-        ui.press(L.TOWER_DAILY, 250, label="tower_daily_tab", expect="none")
-        ui.wait(1.7)
-        im = ui.screen("tower_daily")
         # 2026-11-08 16:59 实机：面板是「叠在塔页上的侧栏」，底下的「挑战」金钮
         # 依然可见可判金 → 旧闸门 `is_gold(TOWER_GO)` 会把「面板已开」误判成
         # 「没打开」并放弃。改成先 OCR 面板文字认门，再找金钮。
-        txt = ""
-        if textocr.available():
-            try:
-                txt = textocr.read_text(im, L.TOWER_DAILY_BOX) or ""
-            except Exception:  # noqa: BLE001
+        # 2026-11-18 第 49 轮：刚关掉进度奖励面板就点「每日奖励」，1.7s 后抓帧还是
+        # 关面板的过渡画面 → OCR 读不到「每日奖励」→ 报 WARN 白丢一次领取。
+        # 现在按完轮询 3 次（每次 0.9s），还读不到就再按一次再看。
+        im = None
+        txt, opened = "", False
+        for round_i in range(2):
+            ui.press(L.TOWER_DAILY, 250, label="tower_daily_tab", expect="none")
+            ui.wait(1.7)
+            for _ in range(3):
+                im = ui.screen("tower_daily")
                 txt = ""
-        opened = any(k in txt for k in ("每日奖励", "明日可领取", "已领取"))
+                if textocr.available():
+                    try:
+                        txt = textocr.read_text(im, L.TOWER_DAILY_BOX) or ""
+                    except Exception:  # noqa: BLE001
+                        txt = ""
+                opened = any(k in txt for k in ("每日奖励", "明日可领取", "已领取"))
+                if opened:
+                    break
+                ui.wait(0.9)
+            if opened:
+                break
         if not opened:
-            log.warn("  塔每日奖励：点 (645,1207) 后面板没打开（页面上读不到「每日奖励」字样），不乱点")
+            log.warn("  塔每日奖励：点了两次 (645,1207) 面板都没打开（页面上读不到「每日奖励」字样），不乱点")
             ui.press(L.TOWER_DAILY_CLOSE, 200, expect="none")
             ui.wait(0.9)
             return n
+        # 2026-11-18 第 49 轮假成功审计：真帧 `logs/_twd0.png` 里 (360,678) 的
+        # `is_gold` 是 True（那是面板上的金色描边/数字，不是按钮），按下去
+        # `diff_ratio=0.0` 什么都没发生，旧码照样 `n += 1` + 打「塔每日奖励已领取」
+        # → 每轮都虚报「领奖励 1」。现在：
+        #   ① 面板 OCR 已经写「今日奖励…已领取」就直接如实说明、一个都不算；
+        #   ② 否则点完必须看到画面变化才计数。
+        flat = txt.replace(" ", "")
         found = False
-        for y in (1000, 930, 860, 678):
-            if vision.is_gold(im, 360, y, r=16):
+        if "已领取" in flat:
+            log.info("  塔每日奖励：面板写着「今日奖励…已领取」，今天已经领过了（不计入领取数）")
+        else:
+            for y in (1000, 930, 860, 678):
+                if not vision.is_gold(im, 360, y, r=16):
+                    continue
+                before = im
                 ui.press((360, y), 220, label=f"tower_daily_claim:{y}", expect="none")
-                ui.wait(1.5)
+                ui.wait(1.6)
+                after = ui.screen("tower_daily2")
+                if vision.diff_ratio(before, after, (0, 150, 720, 1200)) < 0.02:
+                    log.info(f"  塔每日奖励：点 (360,{y}) 后画面没变化（那里不是领取钮），不计入")
+                    im = after
+                    continue
                 n += 1
                 found = True
-                log.info("  塔每日奖励已领取")
+                log.info(f"  塔每日奖励领取 ×1（点 (360,{y})，画面已变化）")
+                im = after
                 break
-        if not found:
-            if "已领取" in txt:
-                log.info("  塔每日奖励：面板写着「今日奖励…已领取」，今天已经领过了")
-            else:
-                log.warn(f"  塔每日奖励：面板里没有金色「领取」（OCR：{txt[:60]}）")
+        if not found and "已领取" not in flat:
+            log.warn(f"  塔每日奖励：面板里没有金色「领取」（OCR：{txt[:60]}）")
         ui.press(L.TOWER_DAILY_CLOSE, 200, expect="none")
         ui.wait(0.9)
         return n
@@ -264,7 +307,8 @@ class TowerTask(BaseTask):
                     ui.wait(1.2)
                 continue
             if st == State.RESULT_GENERIC:
-                ui.press(L.TREE_RESULT_OK_FINAL, 220, label="tower_final_ok")
+                ui.press(L.TREE_RESULT_OK_FINAL, 220, label="tower_final_ok",
+                         expect="none")
                 ui.wait(1.6)
                 ui.press(L.BLANK, 150, expect="none")
                 ui.wait(1.0)
@@ -427,12 +471,19 @@ class LegendTask(BaseTask):
             done += 1
             log.info(f"  传奇试炼 {done}")
             page.deploy_and_skip(skip_delay=7.0)
+        # 2026-11-18（用户第 12 项）：打完补领「首通奖励」——它不会自动发，必须手动领。
+        claimed = 0
+        if page.at_page() or page.enter():
+            claimed = page.claim_rewards()
         MainCity(ui).ensure()
         if done <= 0 and not no_att:
             # 2026-11-09 假成功审计：一次都没打成、又不是「没次数」→ 不能报 OK
             return TaskResult.fail("传奇试炼：一次都没打（入口/挑战钮/次数都没走通）",
-                                   {"fights": done})
-        return TaskResult(True, f"传奇试炼 {done} 次", {"fights": done})
+                                   {"fights": done, "claimed": claimed})
+        msg = f"传奇试炼 {done} 次"
+        if claimed:
+            msg += f"，领首通奖励 {claimed}"
+        return TaskResult(True, msg, {"fights": done, "claimed": claimed})
 
 
 class TreeTask(BaseTask):
@@ -657,20 +708,29 @@ class TreeTask(BaseTask):
             im = ui.screen("tree")
             st = vision.classify(im)
             if st == State.RESULT_TREE:
+                # 2026-11-19 假成功审计（audit2 TOP9）：以前先 wins += 1 再推结算页，
+                # 结算页推不走时同一张页会被反复计数。现在先推页，确认离开了才计数。
+                arrow_tries = blanks = 0
+                res.next_tree()
+                ui.wait(1.8)
+                if vision.classify(ui.screen("tree_next_chk")) == State.RESULT_TREE:
+                    log.info("  时光之树：点「下一关」后还停在结算页（按钮没响应），这次不计数，重试")
+                    continue
                 wins += 1
                 streak = 0
-                arrow_tries = blanks = 0
                 log.info(f"  时光之树通关 {wins}")
-                res.next_tree()
                 continue
             if st == State.RESULT_GENERIC:
                 # 章节最后一关的胜利页
-                wins += 1
-                streak = 0
                 arrow_tries = blanks = 0
-                log.info(f"  时光之树枝章节通关 {wins}")
                 ui.press(L.TREE_RESULT_OK_FINAL, 220)
                 ui.wait(2.6)
+                if vision.classify(ui.screen("tree_ok_chk")) in (State.RESULT_TREE, State.RESULT_GENERIC):
+                    log.info("  时光之树：点「确定」后还停在结算页，这次不计数，重试")
+                    continue
+                wins += 1
+                streak = 0
+                log.info(f"  时光之树枝章节通关 {wins}")
                 continue
             if st == State.DEPLOY:
                 page.deploy_and_skip()
@@ -845,6 +905,7 @@ class DemonTask(BaseTask):
 
         wins = picks = 0
         att = 0                # 2026-11-09 假成功审计 M6：真正进入战斗的次数
+        armed = False          # 2026-11-19 审计 C5：本轮按过挑战/进入过战斗
         lost = False           # 真打过但输了（真状态，不算脚本故障）
         noop = False           # 今天已完成/没有可点按钮（真状态，不是脚本故障）
         unknown = 0
@@ -859,9 +920,16 @@ class DemonTask(BaseTask):
                 # 2026-11-08：快速挑战瞬间结算后会弹「获得奖励 … 点击空白处关闭」，
                 # 浮层盖住底部按钮；旧版这里认不出按钮 → 记「通关 0 关」直接收手。
                 page.dismiss_rewards(im)
-                wins += 1
                 same = 0
-                log.info(f"  邪能通关 {wins}（快速挑战结算，已关掉奖励浮层）")
+                # 2026-11-19 审计 C5：以前「看到浮层就 +1」，任务刚进来时上一轮残留的
+                # 浮层也会被算成一次通关。现在要求本轮按过挑战/进过战斗。
+                if armed:
+                    armed = False
+                    wins += 1
+                    log.info(f"  邪能通关 {wins}（快速挑战结算，已关掉奖励浮层）")
+                else:
+                    log.info("  邪能神殿：看到奖励浮层，但本轮还没按过挑战，"
+                             "当残留浮层关掉（不计入通关）")
                 continue
             if page.buff_dialog(im):
                 if page.pick_buff():
@@ -875,18 +943,44 @@ class DemonTask(BaseTask):
             if st == State.RESULT_TREE:
                 # 按实测金带中心点「下一关」（固定 (495,1130) 压在按钮下沿，
                 # 偶尔 MISS 后靠 -8 补偿才命中，白花 2s）
-                nxt = vision.gold_band_center(im, L.RESULT_BTN_ZONE) or L.TREE_RESULT_NEXT
+                nxt = vision.gold_band_center(im, L.RESULT_BTN_ZONE)
+                if nxt is None:
+                    # 2026-11-20 审计 MAJOR：金带读不到时不再按写死坐标点，
+                    # 等一下重抓帧（结算页偶有淡入动画）。
+                    log.info("  邪能神殿：结算页读不到「下一关」金钮，等 1.5s 再看（不按死坐标）")
+                    ui.wait(1.5)
+                    continue
                 ui.press(nxt, 220, label=f"demon_next:{nxt[1]}", expect="none")
                 ui.wait(2.2)
+                # 2026-11-19 假成功审计（audit2 TOP2）：结算页分支以前既没有 armed 门
+                # 也不复核翻页 —— 结算页推不走时同一张页会反复 +1。
+                if not armed:
+                    log.info("  邪能神殿：结算页出现时本轮还没按过挑战（上一轮的残留页），不计入")
+                    continue
+                if vision.classify(ui.screen("demon_next_chk")) == State.RESULT_TREE:
+                    log.info("  邪能神殿：点「下一关」后还停在结算页（按钮没响应），这次不计数，重试")
+                    continue
+                armed = False
                 wins += 1
                 same = 0
                 log.info(f"  邪能通关 {wins}")
                 continue
             if st == State.RESULT_GENERIC:
                 # 章节最后一关：结算页只有「确定」，同样按金带中心点
-                ok = vision.gold_band_center(im, L.RESULT_BTN_ZONE) or L.TREE_RESULT_OK_FINAL
+                ok = vision.gold_band_center(im, L.RESULT_BTN_ZONE)
+                if ok is None:
+                    log.info("  邪能神殿：结算页读不到「确定」金钮，等 1.5s 再看（不按死坐标）")
+                    ui.wait(1.5)
+                    continue
                 ui.press(ok, 220, label=f"demon_final:{ok[1]}", expect="none")
                 ui.wait(2.4)
+                if not armed:
+                    log.info("  邪能神殿：结算页出现时本轮还没按过挑战（上一轮的残留页），不计入")
+                    continue
+                if vision.classify(ui.screen("demon_final_chk")) in (State.RESULT_TREE, State.RESULT_GENERIC):
+                    log.info("  邪能神殿：点「确定」后还停在结算页，这次不计数，重试")
+                    continue
+                armed = False
                 wins += 1
                 same = 0
                 log.info(f"  邪能通关 {wins}（本章完成）")
@@ -894,8 +988,18 @@ class DemonTask(BaseTask):
             if st == State.RESULT_DEFEAT:
                 shot = ui.screen("demon_defeat")
                 # 实测战败页「确定」金带 (363,1088)；旧码试 (360,1060)/(235,1055) 都偏
-                pos = (vision.gold_band_center(shot, L.RESULT_BTN_ZONE)
-                       or L.DEMON_DEFEAT_OK)
+                pos = vision.gold_band_center(shot, L.RESULT_BTN_ZONE)
+                if pos is None:
+                    # 战败页读不到「确定」就不按死坐标（会把流程带偏），最多重试 3 次
+                    defeat_none = getattr(self, "_defeat_none", 0) + 1
+                    self._defeat_none = defeat_none
+                    if defeat_none >= 3:
+                        lost = True
+                        log.info("  邪能神殿：战败页连着 3 次读不到「确定」金钮，收手（不按死坐标）")
+                        break
+                    log.info("  邪能神殿：战败页读不到「确定」金钮，等 1.5s 再看（不按死坐标）")
+                    ui.wait(1.5)
+                    continue
                 ui.press(pos, 220, label=f"demon_defeat_ok:{pos[1]}", expect="none")
                 ui.wait(1.6)
                 lost = True
@@ -913,6 +1017,7 @@ class DemonTask(BaseTask):
                 if self._deploy_and_fight(ui) == "gave_up":
                     break
                 att += 1
+                armed = True
                 continue
             if st == State.BATTLE:
                 # 2026-11-08 真帧纠正（tests/fixtures/demon_*）：邪能战斗页右侧是
@@ -944,10 +1049,14 @@ class DemonTask(BaseTask):
 
             r = page.press_main()
             if r in ("deploy", "battle"):
+                armed = True
                 same = 0
                 continue
             if r == "same":
-                # 一键扫荡/符文自动选择阶段：按一下画面不变但流程在推进
+                # 一键扫荡/符文自动选择阶段：按一下画面不变但流程在推进。
+                # 2026-11-20 审计 MAJOR：这里原来也把 armed 置真，等于让残留的
+                # 结算/奖励浮层也能被算成一次通关 —— armed 只在 r 为 deploy/battle
+                # （真进过布阵或战斗）时才置真，无变化分支保持原值。
                 same += 1
                 if same >= 4:
                     log.info("  邪能神殿连续点击无变化，停止（今日大概已完成/次数为 0）")

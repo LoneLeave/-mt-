@@ -148,44 +148,6 @@ class GloryTask(BaseTask):
             cur = ui.screen(f"glory_promo_after{i + 1}")
         return cur
 
-    # ---------- 进入 ----------
-    def _enter(self, ui) -> bool:
-        im = ui.screen("glory_before")
-        if self._at_page(im):
-            return True
-        for attempt in range(2):
-            ui.press(L.TAB_ARENA, 250, label=f"glory_tab{attempt + 1}", expect="none")
-            ui.wait(2.4)
-            hub = ui.screen(f"glory_hub{attempt + 1}")
-            pos = None
-            try:
-                for t, c, _bb, _s in textocr.read_lines(hub, L.GLORY_ENTRY_TEXT_BOX, min_score=0.5):
-                    if "荣耀竞技场" in t:
-                        pos = c
-                        break
-            except Exception:
-                pos = None
-            if pos is None:
-                log.info("  荣耀竞技场：竞技页上没读到「荣耀竞技场」这一行，再试一次")
-                continue
-            ui.press(pos, 250, label="glory_entry", expect="none")
-            ui.wait(3.0)
-            im = ui.screen("glory_open")
-            if self._at_page(im):
-                return True
-            log.info("  荣耀竞技场：点了「荣耀竞技场」但没进页（可能被浮层挡住），再试一次")
-        log.warn("  荣耀竞技场：进不去（竞技页/入口可能又改了），本次跳过")
-        return False
-
-    # ---------- 一把 ----------
-    @staticmethod
-    def _promo_open(im) -> bool:
-        """「晋级成功」浮层（打完晋级才弹，底部写「点击空白处关闭」）。"""
-        try:
-            return "晋级成功" in (textocr.read_text(im, L.GLORY_PROMO_BOX) or "")
-        except Exception:
-            return False
-
     def _one_fight(self, ui, idx: int):
         """打一把。返回 "win"/"lose"/"done"（打了没看清胜负）/None（没打起来）。
 
@@ -237,7 +199,8 @@ class GloryTask(BaseTask):
         log.info("  荣耀竞技场：等结算超时（50×1.2s），本次收手")
         return None
 
-    def _buy_one(self, ui, before_att: int | None = None, d0: int | None = None):
+    def _buy_one(self, ui, before_att: int | None = None, d0: int | None = None,
+                 ctx: TaskContext | None = None):
         """买 1 次挑战次数（钻石）。返回 (成功?, 花费钻石, 说明)。
 
         用户规则（2026-11-10）：钻石只允许用来买挑战次数 —— 这条路允许走，
@@ -268,6 +231,14 @@ class GloryTask(BaseTask):
             ui.press(L.ARENA_BUY_CANCEL, 200, label="glory_buy_cancel_poor", expect="none")
             ui.wait(1.0)
             return False, 0, f"主城钻石 {d0} < 花费 {cost}，买不起，不点购买"
+        # 2026-11-20 审计 C6：调用方原来在弹窗还没开的时候就
+        # may_spend(ctx, ..., None) —— 传 None 等于预算闸形同虚设。
+        # 现在等弹出框里真读到「花费 N」再走闸门，金额是真的。
+        if ctx is not None and not self.may_spend(ctx, "荣耀竞技场买 1 次挑战次数",
+                                                  cost, kind="attempt"):
+            ui.press(L.ARENA_BUY_CANCEL, 200, label="glory_buy_cancel_gate", expect="none")
+            ui.wait(1.0)
+            return False, 0, f"花费 {cost} 钻，被预算/保护策略拦下，不点购买"
         if before_att is None:
             before_att = self._attempts(im)
         ui.press(L.ARENA_BUY_CONFIRM, 220, label="glory_buy_confirm", expect="none")
@@ -310,11 +281,9 @@ class GloryTask(BaseTask):
             if d0 is None:
                 log.info("  荣耀竞技场：主城钻石读数失败 → 不做任何买次数动作（无自证不花钻）")
                 break
-            if not self.may_spend(ctx, "荣耀竞技场买 1 次挑战次数", None, kind="attempt"):
-                break
             ui.press(L.GLORY_BUY_PLUS, 200, label="glory_buy_plus", expect="none")
             ui.wait(1.8)
-            ok, spent, why = self._buy_one(ui, before_att=left, d0=d0)
+            ok, spent, why = self._buy_one(ui, before_att=left, d0=d0, ctx=ctx)
             log.info(f"  荣耀竞技场买次数：{why}")
             if not ok:
                 break
@@ -340,6 +309,7 @@ class GloryTask(BaseTask):
 
         deadline = time.time() + 20 * 60
         noop = 0
+        att_unread = False
         while fights < max_fights and time.time() < deadline:
             res = self._one_fight(ui, fights + 1)
             if res is None:            # 没打起来：先看次数，再决定是「打完了」还是真卡住
@@ -372,8 +342,11 @@ class GloryTask(BaseTask):
             if att is not None:
                 left = att
             if left is None and self._match_pos(chk) is None:
-                log.info("  荣耀竞技场：次数读不到，页面上也没有可点的「开始匹配」 → 按今天没得打处理")
-                left = 0
+                # 2026-11-20 审计 MAJOR：旧码这里直接 left = 0，于是
+                # ok = fights > 0 or left == 0 恒真 → 缺证也报成功。
+                # 现在只记「次数读不到」，由收尾分支如实跳过，不冒充「已打空」。
+                log.info("  荣耀竞技场：次数读不到，页面上也没有可点的「开始匹配」 → 按今天没得打处理（缺证）")
+                att_unread = True
         self._leave(ui)
         d1 = self.diamonds_stable(ui, "glory_d1")
         if bought:
@@ -382,14 +355,22 @@ class GloryTask(BaseTask):
                 log.warn(f"  荣耀竞技场：买次数花了 {bought} 钻，但主城钻石前后对比缺证（{d0}→{d1}）")
             else:
                 log.info(f"  荣耀竞技场：买次数花钻 {spent}（主城 {d0}→{d1}），挑战次数已到账")
-        msg = f"荣耀竞技场：挑战 {fights} 次（胜 {wins}" + (f"，余 {left}" if left is not None else "") + "）"
-        if bought:
-            msg += f"，买次数花钻 {bought}"
-        ok = fights > 0 or left == 0
         stats = {"fights": fights, "wins": wins, "left": left,
                  "diamonds_before": d0, "diamonds_after": d1}
         if bought:
             stats["diamonds_spent_nominal"] = bought
+        if fights == 0 and left is None and att_unread:
+            stats["noop_ok"] = True
+            stats["attempts_unreadable"] = True
+            return TaskResult(
+                True,
+                "跳过：荣耀竞技场次数读不到、也没有「开始匹配」按钮"
+                "（缺证，按今天没得打处理）" + (f"，买次数花钻 {bought}" if bought else ""),
+                stats)
+        msg = f"荣耀竞技场：挑战 {fights} 次（胜 {wins}" + (f"，余 {left}" if left is not None else "") + "）"
+        if bought:
+            msg += f"，买次数花钻 {bought}"
+        ok = fights > 0 or left == 0
         if fights == 0:
             stats["noop_ok"] = True
         return TaskResult(ok, msg, stats)

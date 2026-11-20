@@ -74,6 +74,26 @@ def is_green(im: Image.Image, x: int, y: int, r: int = 14) -> bool:
     return R < 195 and G > 165 and (G - R) > 25 and (G - B) > 20
 
 
+def green_ratio(im: Image.Image, box, step: int = 1) -> float:
+    """box 内「绿勾」像素占比（勾选框开关状态）。
+
+    实测（2026-11-20 `logs/_bag_dec.png`，印记分解页底部
+    「获得普通、史诗印记时自动分解」）：已勾上时勾选框 (180,836,224,880)
+    绿像素占比 0.206，右侧文字区 0.000、空白面板 0.000 → 阈值 0.05 干净。
+    单点 is_green 不行：白底圆角框把均值拉高了，这里要按像素占比。
+    """
+    x0, y0, x1, y1 = box
+    x1, y1 = min(x1, im.width), min(y1, im.height)
+    n = hit = 0
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            R0, G0, B0 = im.getpixel((x, y))[:3]
+            n += 1
+            if G0 > R0 + 18 and G0 > B0 + 18 and G0 > 85:
+                hit += 1
+    return hit / n if n else 0.0
+
+
 def is_amber(im: Image.Image, x: int, y: int, r: int = 14) -> bool:
     """浅琥珀色按钮（圣物羁绊「升级」这类：比主按钮更淡的黄）。
 
@@ -144,6 +164,7 @@ class State(str, Enum):
     CONFIRM_DIALOG = "confirm_dialog"  # 通用确认弹窗（左红取消）
     DIALOG = "dialog"                  # 米色弹窗（公告/奖励/提示，点空白关闭）
     NAV_PAGE = "nav_page"              # 主城体系一级页（英雄/助阵/战役/历练…有底部导航条）
+    LOADING = "loading"                # 黑屏加载（游戏重启/切场景，画面全黑只剩左上角小图标）
     UNKNOWN = "unknown"
 
 
@@ -211,6 +232,18 @@ def quit_dialog(im: Image.Image) -> bool:
     return R3 > 190 and G3 > 190 and B3 > 190
 
 
+def dialog_confirm(im: Image.Image) -> bool:
+    """有确认框压在上面：整屏被压暗、且不是物品说明浮层。
+
+    2026-11-20 审计 M1/M2：`confirm_dialog()` 要求 (235,700) 是红像素，全库 5867 帧
+    **一次都没命中**（取消钮在弹窗里的位置随弹窗高度变，不在固定点），于是悬赏刷新
+    确认框、铁匠铺一键50级确认框、助战升级确认框、副本付费扫荡确认框四条分支
+    永远进不去 —— 该拦的不拦。这里改用已大量验证的 `modal_dim()`（999 帧压暗为真、
+    24 张真弹窗全命中），并排除「物品说明浮层」（那种没有确认钮）。
+    """
+    return modal_dim(im) and not item_popup(im)
+
+
 def confirm_dialog(im: Image.Image) -> bool:
     """通用确认弹窗：左侧红色「取消」按钮 **且** 整屏被压暗（真的模态弹窗）。
 
@@ -226,16 +259,62 @@ def confirm_dialog(im: Image.Image) -> bool:
     return is_red(im, 235, 700, r=8) and modal_dim(im)
 
 
-def title_screen(im: Image.Image) -> bool:
-    """标题页「开始游戏」大金按钮（实测中心在 (360,1000)）。
+def loading_black(im: Image.Image) -> bool:
+    """黑屏加载态：整屏几乎全黑（2026-11-19 06:54 事故帧实测全屏均值 2.2，最大 255）。
 
-    活动页底部也有一排金色按钮，用「左边 (150,1000) 不是金按钮」来排除。
+    这个状态以前落到 UNKNOWN，`ensure_main_city` 认为「没有可用出口」直接放弃，
+    连着两个任务就中止整轮。它其实只需要等（或重启游戏），不是死页面。
+    """
+    try:
+        w, h = im.size
+        n = 0
+        tot = 0
+        for y in range(120, h - 80, 120):
+            for x in range(60, w - 60, 120):
+                R, G, B = im.getpixel((x, y))
+                tot += 1
+                if R + G + B >= 36:      # 明显不是黑的点
+                    n += 1
+        return tot > 0 and n <= max(1, tot // 20)
+    except Exception:
+        return False
+
+
+def title_screen(im: Image.Image) -> bool:
+    """标题页「开始游戏」大金按钮。
+
+    2026-11-19 06:06 实测两个问题：
+    1. 改版后的「开始游戏」是金底黑字，中心点被字形盖住 —— `is_gold(360,1000,r=8)`
+       在真帧上是 False，于是标题页一路落到 `battle_page` 被判成「战斗中」，
+       回主城流程按战斗乱点，最后「登录超时」；
+    2. 只靠「(360,1000) 是金的」又会把一堆米色弹窗（98元/晋升为司令/挑战…）当成标题页。
+    现在：先模板确认（阈值 0.90），没命中再看金钮兜底；命中后用 OCR 小框
+    确认那行字就是「开始游戏」，否则一律不算标题页。
     """
     if main_city(im):
         return False
-    if is_gold(im, 150, 1000, r=8):
+    hit = False
+    try:
+        from . import template as _T
+        hit = _T.VI.find(im, "登录页_开始游戏.png", 0.90,
+                         roi=(250, 950, 480, 1060)) is not None
+    except Exception:          # pragma: no cover - 模板缺失时退回像素判据
+        hit = False
+    if not hit:
+        if is_gold(im, 150, 1000, r=8):
+            return False
+        hit = is_gold(im, 360, 1000, r=8)
+    if not hit:
         return False
-    return is_gold(im, 360, 1000, r=8)
+    try:
+        from . import textocr as _ocr
+        if not _ocr.available():
+            return True                 # 没有 OCR 时退回旧的像素判据
+        # 小框只框「开始游戏」那行字（bbox 293,984,426,1024），面积小 → OCR 快
+        txt = _ocr.read_text(im, (288, 976, 432, 1032)).replace(" ", "")
+        return "开始游戏" in txt
+    except Exception:                   # pragma: no cover
+        return True
 
 
 def trials_hub(im: Image.Image) -> bool:
@@ -608,7 +687,17 @@ def reconnect_login_dialog(im: Image.Image) -> bool:
         return False
     a = avg(im, 360, 600, r=8)
     b = avg(im, 150, 600, r=8)
-    return _pale(*a) and _pale(*b)
+    if not (_pale(*a) and _pale(*b)):
+        return False
+    # 2026-11-19 02:50 事故：付费商店页「福利礼包」也在 (360,748) 有金钮、
+    # 旁边是米色卡片，被判成断线弹窗 → 对着付费页盲点 5 下。
+    # 断线弹窗是「整屏压暗 + 居中面板」，屏幕下半的左/右边缘是暗的；
+    # 商店页那两处是亮的背景（实测 (228,217,185) / (226,213,180)）。
+    bl = avg(im, 60, 1000, r=8)
+    br = avg(im, 660, 1000, r=8)
+    if (sum(bl) / 3.0) > 200 or (sum(br) / 3.0) > 200:
+        return False
+    return True
 
 
 def summon_result(im: Image.Image) -> bool:
@@ -732,6 +821,9 @@ def classify(im: Image.Image) -> State:
         return State.RECONNECT
     if reconnect_login_dialog(im):
         return State.RECONNECT_LOGIN
+    # 黑屏加载：必须排在标题/战斗之前（全黑帧会被 battle_page 的「中部偏暗」命中）
+    if loading_black(im):
+        return State.LOADING
     if title_screen(im):
         return State.TITLE
     # 米色弹窗（公告/奖励/提示）：必须在结算/战斗之前挡掉，否则会被误判

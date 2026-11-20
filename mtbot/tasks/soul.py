@@ -151,6 +151,23 @@ class SoulTask(BaseTask):
                 self._drain_banner(ui, page)
                 return False, True
             if kind == "result":
+                # 2026-11-19：首领战的结算页必须先把「胜利/失败」读出来再关。
+                # 旧码这里直接 close_result() 把结果扔了 → 回塔页面后横幅读不到
+                # 「挑战成功」、次数又不变 → 白等 240 秒判 unknown（_soul_boss1 两次 FAIL）。
+                rt = ""
+                try:
+                    if textocr.available():
+                        rt = textocr.read_text(im, L.SOUL_RESULT_ROI).replace(" ", "")
+                except Exception:        # noqa: BLE001 - 读不到就看下面兜底
+                    rt = ""
+                if any(k in rt for k in L.SOUL_RESULT_WIN_KEYS):
+                    page.close_result()
+                    self._drain_banner(ui, page)
+                    return True, False
+                if any(k in rt for k in L.SOUL_RESULT_LOSE_KEYS):
+                    page.close_result()
+                    self._drain_banner(ui, page)
+                    return False, True
                 page.close_result()
                 continue
             if kind == "codex":
@@ -184,12 +201,15 @@ class SoulTask(BaseTask):
                     return False, True
                 # 次数只能靠 OCR 读（模板法恒空），单次约 4.6s → 最多每 5s 读一次，
                 # 否则等结算的那 90 秒里会反复付这笔钱。
+                # 2026-11-19 审计：这里原来「次数变少就判通关」，但同一函数的注释
+                # （见上）已经写明快速战斗胜负都不改变次数 → 那条判断拿不到真证据，
+                # 还会因 OCR 把 18/20 读成 17/20 而虚报一关胜利。现在只记日志不判胜负。
                 if time.time() - last_att >= 5.0:
                     last_att = time.time()
                     att_now = page.attempts(im)
                     if att_before and att_now and att_now[0] < att_before[0]:
-                        self._drain_banner(ui, page)
-                        return True, False
+                        log.info(f"  罪魂之域：挑战次数 {att_before} → {att_now}"
+                                 f"（快速战斗胜负都不改次数，这里不据此判胜负）")
         log.warn(f"  罪魂之域：{budget:.0f} 秒内没看到明确结果，按未通关处理")
         return False, False
 
@@ -200,7 +220,7 @@ class SoulTask(BaseTask):
             ui.press(L.DEPLOY, 200, expect="none")
             ui.wait(1.2)
             ui.press(L.SOUL_DEPLOY_GO, 250, label="soul_deploy_go", expect="none")
-        win, lose = self._wait_battle(ui, page, None, budget=240.0)
+        win, lose = self._wait_battle(ui, page, None, budget=300.0)
         return "win" if win else ("lose" if lose else "unknown")
 
     # ---------- 单个节点 ----------
@@ -282,6 +302,92 @@ class SoulTask(BaseTask):
             return "lose"
         return "unknown"
 
+    # ---------- 首领塔（第 N 层）版页面 ----------
+
+    @staticmethod
+    def _boss_mode_text(im) -> str:
+        """读整页文字（用于判断是不是首领塔页面）。读不到返回空串。"""
+        try:
+            if not textocr.available():
+                return ""
+            return textocr.read_text(im, (0, 60, 720, 1240)).replace(" ", "")
+        except Exception:            # noqa: BLE001
+            return ""
+
+    def _enter_boss(self, ui, page: SoulPage) -> bool:
+        """从塔页面点开首领页；成功返回 True。"""
+        for pos in L.SOUL_BOSS_ENTRY_CANDS:
+            ui.press(pos, 200, label=f"soul_boss_entry:{pos[0]},{pos[1]}", expect="none")
+            ui.wait(1.6)
+            im = ui.screen("soul_boss_open")
+            txt = self._boss_mode_text(im)
+            kind = page.screen_kind(im, txt)
+            if kind == "boss":
+                log.info(f"  罪魂之域：点 {pos} 打开了首领页")
+                return True
+            if kind not in ("map", ""):
+                self._settle(ui, page, kind, txt)
+        return False
+
+    def _run_boss_mode(self, ui, page: SoulPage, att, max_fights: int,
+                       deadline_s: float = 1500.0) -> "TaskResult":
+        """首领塔：点首领 → 首领页挑战 → 布阵 → 战斗，直到次数用尽/连败/到时限。"""
+        deadline = time.time() + deadline_s
+        wins = loses = 0
+        reason = ""
+        limit = int(L.SOUL_BOSS_FIGHT_LIMIT)
+        log.info("  罪魂之域：今天这版是「第 N 层首领」塔（没有水晶路线），走首领挑战")
+
+        while wins + loses < max_fights and time.time() < deadline:
+            if ui.handle_interruptions():
+                continue
+            im, txt, kind = self._read(ui, "soul_boss_loop")
+            if kind not in ("", "map"):
+                self._settle(ui, page, kind, txt)
+                continue
+            if not page.at_page(im):
+                if not page.enter():
+                    reason = "中途离开后又进不去罪魂之域"
+                    break
+                continue
+            fresh = page.attempts(im)
+            if fresh is not None:
+                att = fresh
+            if att and att[0] <= 0:
+                reason = f"挑战次数用尽（{att[0]}/{att[1]}）"
+                break
+            if not self._enter_boss(ui, page):
+                reason = "点不开首领页"
+                break
+            res = self._fight_boss(ui, page)
+            if res == "win":
+                wins += 1
+                log.info(f"  罪魂之域：首领战第 {wins} 胜")
+            elif res == "lose":
+                loses += 1
+                log.info(f"  罪魂之域：首领战第 {loses} 负（这一场没打过）")
+                if loses >= limit and wins == 0:
+                    reason = "连败"
+                    log.info(f"  罪魂之域：首领战连输 {loses} 场，战力不够，收手")
+                    break
+            else:
+                reason = "首领战没有明确结果"
+                break
+            # 战斗结束后可能弹秘典/结算，逐帧收掉，直到回到塔页面
+            for _ in range(3):
+                im2, txt2, kind2 = self._read(ui, "soul_boss_after")
+                if kind2 in ("", "map"):
+                    break
+                self._settle(ui, page, kind2, txt2)
+
+        self._leave(ui)
+        stats = {"wins": wins, "loses": loses, "mode": "boss"}
+        if wins:
+            return TaskResult(True, f"罪魂之域（首领会战）：胜 {wins} 负 {loses}", stats)
+        if loses:
+            return TaskResult.skip(f"罪魂之域（首领会战）：今天一关都没打过（{loses} 负）", stats)
+        return TaskResult.fail(f"罪魂之域：0 关（{reason or '首领塔没有可打的'}）", stats)
+
     # ---------- 主流程 ----------
 
     def run(self, ctx: TaskContext) -> TaskResult:
@@ -307,6 +413,17 @@ class SoulTask(BaseTask):
             return TaskResult.skip(f"挑战次数已用尽（{att[0]}/{att[1]}，每日登录 +5）")
         if att is None:
             log.warn("  罪魂之域：读不出挑战次数，按「还能打」继续")
+
+        # 2026-11-19：页面可能是「第 N 层首领」塔（没有水晶格点）。
+        # 旧码继续扫 30 个格点 → 全空 → FAIL「探测网格里已经没有可挑战的关卡」。
+        flat_map = ""
+        try:
+            if textocr.available():
+                flat_map = textocr.read_text(im, (0, 60, 720, 1240)).replace(" ", "")
+        except Exception:            # noqa: BLE001 - 读不到就按老路走
+            flat_map = ""
+        if any(k in flat_map for k in L.SOUL_BOSS_MODE_KEYS):
+            return self._run_boss_mode(ui, page, att, max_nodes, deadline_s=25 * 60)
 
         wins = loses = 0
         locked = 0

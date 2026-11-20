@@ -11,6 +11,7 @@ import sys
 import unittest
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
@@ -2169,7 +2170,8 @@ class ResultButtonTests(unittest.TestCase):
         src = _io.open(Path(__file__).resolve().parent.parent / "mtbot" / "tasks"
                        / "combat.py", encoding="utf-8").read()
         self.assertIn("vision.gold_band_center(im, L.RESULT_BTN_ZONE)", src)
-        self.assertIn("L.DEMON_DEFEAT_OK", src)
+        # 2026-11-20 审计 MAJOR：读不到金带也不再退回死坐标（源码里只留注释说明）
+        self.assertIn("不按死坐标", src)
         lay = _io.open(Path(__file__).resolve().parent.parent / "mtbot"
                        / "layout.py", encoding="utf-8").read()
         self.assertIn("RESULT_BTN_ZONE", lay)
@@ -2259,8 +2261,9 @@ class RelicMaterialTests(unittest.TestCase):
             encoding="utf-8").read()
         self.assertIn("材料不足（有 ", src)
         self.assertIn("一次一键升级要 ", src)
-        # 确认框路径仍在（材料够的时候）
-        self.assertIn("一键升级：确认框已点掉，算 1 次", src)
+        # 2026-11-19 假成功审计：确认框点掉不算证据，必须看材料进度变化
+        self.assertIn("一键升级：确认框已点掉，材料 ", src)
+        self.assertIn("确认框点掉了但材料没变", src)
 
     def test_progress_box_covers_material_row(self):
         from mtbot import layout as LL
@@ -2297,10 +2300,13 @@ class TowerRewardTests(unittest.TestCase):
         # 2026-11-08 17:04 改判据：面板是「叠在塔页上的侧栏」，底下挑战金钮仍亮，
         # 旧的 is_gold(TOWER_GO) 闸门必然误判「没打开」→ 现在必须先 OCR 认面板。
         self.assertIn('opened = any(k in txt for k in ("每日奖励", "明日可领取", "已领取"))', src)
-        self.assertIn("面板没打开（页面上读不到「每日奖励」字样），不乱点", src)
-        self.assertIn('if "已领取" in txt:', src)
-        self.assertIn("_progress_undone", src)
-        self.assertIn("都还没达成", src)
+        # 2026-11-18 第 49 轮：面板读不到时试点两次；读到后必须用「已领取」文案或
+        # 画面变化双证才计数（旧码只要 (360,678) 是金就 n+=1 → 每轮虚报「领奖励 1」）。
+        self.assertIn("面板都没打开（页面上读不到「每日奖励」字样），不乱点", src)
+        self.assertIn('if "已领取" in flat:', src)
+        self.assertIn("_progress_claimed", src)
+        self.assertIn("没有可领的（本次已领", src)
+        self.assertIn("那里不是领取钮），不计入", src)
 
 class GoldBandPointTests(unittest.TestCase):
     """金带质心可能落在装饰上，必须 is_gold 复核（2026-11-08 邪能空点）。"""
@@ -2470,7 +2476,8 @@ class TowerDailyTests(unittest.TestCase):
     def test_branch_uses_ocr_not_gold_gate(self):
         src = (HERE.parent / "mtbot" / "tasks" / "combat.py").read_text(encoding="utf-8")
         self.assertIn('opened = any(k in txt for k in ("每日奖励", "明日可领取", "已领取"))', src)
-        self.assertIn('"已领取" in txt', src)
+        self.assertIn('if "已领取" in flat:', src)
+        self.assertIn("diff_ratio(before, after, (0, 150, 720, 1200)) < 0.02", src)
         self.assertIn('label="tower_daily_tab", expect="none"', src)
 
 class DungeonChestCountTests(unittest.TestCase):
@@ -2945,8 +2952,10 @@ class ActionHitInstrumentationTests(unittest.TestCase):
 
     def test_hits_only_counts_verified_changes(self):
         self.assertIn("self.hits = 0", self.UI)
-        # 两处命中分支（首点 + 补偿点）都要 +1
-        self.assertEqual(self.UI.count("self.hits += 1"), 2)
+        # 三处命中分支（首点 + 同坐标重试 + 补偿点）都要 +1：
+        # 2026-11-20 新增「同坐标重试」，用于真机上“刚切页 1~2 秒 UI 吞点击”的情形，
+        # 这种命中同样要计入 hits，否则命中率统计会漏掉被吞后又点成的那次。
+        self.assertEqual(self.UI.count("self.hits += 1"), 3)
 
     def test_hits_not_counted_for_blind_press(self):
         # expect="none" 的早退分支里不能出现 hits 自增
@@ -3150,7 +3159,7 @@ class AuditRecheckBatchThreeTests(unittest.TestCase):
         # 现在按截止时间轮询，默认 200s。
         self.assertIn("def trial_save(self, timeout: float = 200.0) -> bool:", self.PAGES)
         i = self.PAGES.find("def trial_save(self, timeout: float = 200.0) -> bool:")
-        seg = self.PAGES[i:i + 1400]
+        seg = self.PAGES[i:i + 2600]
         self.assertIn("end = time.time() + max(20.0, float(timeout))", seg)
         self.assertIn("while time.time() < end:", seg)
         self.assertIn("fighting = vision.classify(im) == State.BATTLE", seg)
@@ -3182,9 +3191,11 @@ class AuditRecheckBatchFourTests(unittest.TestCase):
 
     def test_forge_star_both_branches_verify(self):
         self.assertIn('before = ui.screen("forge_star_before")', self.REWARD)
-        self.assertIn('before = ui.screen("forge_star_before2")', self.REWARD)
-        self.assertEqual(self.REWARD.count("still and vision.similar(before, after)"), 2)
-        i = self.REWARD.find('before = ui.screen("forge_star_before2")')
+        # 2026-11-19：判据升级成「弹窗必须消失（forge_star_dialog(after) == none）」，
+        # 进店自动弹窗与主循环两处都要用同一条判据
+        self.assertEqual(self.REWARD.count('st_after = vision.forge_star_dialog(after)'), 2)
+        self.assertEqual(self.REWARD.count('if st_after != "none":'), 2)
+        i = self.REWARD.find('after = ui.screen("forge_star_after2")')
         seg = self.REWARD[i:i + 900]
         self.assertIn("star_out = True", seg)      # 没升成 → 本轮判「到头」，避免空转
 
@@ -3249,7 +3260,10 @@ class RankScanTests(unittest.TestCase):
         i = src.index("    def claim_rows(self) -> int:")
         seg = src[i:src.index("    def promote(self) -> bool:")]
         self.assertIn("for _ in range(2):", seg)
-        self.assertIn("self.ui.dev.scroll_up(360, 1000, 400, 500)", seg)
+        # 2026-11-18 用户要求「官阶奖励进页不要下滑」：scroll_up 是手指上划=看下面，
+        # 归位顶部要用 scroll_down；这条断言改成钉死「归位用 scroll_down」。
+        self.assertIn("self.ui.dev.scroll_down(360, 350, 1000, 450)", seg)
+        self.assertNotIn("self.ui.dev.scroll_up(360, 1000, 400, 500)", seg)
         self.assertIn("if idle >= 4:", seg)
         self.assertNotIn("if idle >= 1:", seg)
         self.assertIn("screens += 1", seg)
@@ -3364,9 +3378,32 @@ class NewTaskCoverageTests(unittest.TestCase):
         self.assertLess(cfg.task("glory").priority, cfg.task("campaign").priority)
 
     def test_ancestor_only_forges_when_free_tag_present(self):
-        self.assertIn('if not self._free(im, free_box):', self.ANC)
+        # 2026-11-18：倒计时文案「16时6分后免费」里同样含「免费」，旧判定会把它
+        # 当成「还免费」→ 在唤灵台上白点了一次「召唤一次」（花掉券）。现在必须
+        # 区分 free / used，且只有 state == "free" 才允许点按钮。
+        self.assertIn('state, raw = self._free_state(im, free_box)', self.ANC)
+        self.assertIn('if state != "free":', self.ANC)
+        self.assertIn('分后免费', self.ANC)
         self.assertIn('TABS = (', self.ANC)
         self.assertNotIn('ANCESTOR_FORGE_TEN', self.ANC)
+
+    def test_ancestor_free_state_reads_countdown_as_used(self):
+        from PIL import Image
+
+        from mtbot import layout as LL
+        from mtbot.tasks.ancestor import AncestorTask
+
+        # 真帧：三台今天都写「16时6分后免费」→ 必须是 used，不能点
+        for frame, box in (("ancestor_forge_free.png", LL.ANCESTOR_FREE_BOX),
+                           ("ancestor_pet_free.png", LL.ANCESTOR_PET_FREE_BOX),
+                           ("ancestor_art_free.png", LL.ANCESTOR_ART_FREE_BOX)):
+            fp = HERE / "fixtures" / frame
+            if not fp.exists():
+                self.skipTest(f"缺样本帧 {frame}")
+            im = Image.open(fp).convert("RGB")
+            state, raw = AncestorTask._free_state(im, box)
+            self.assertEqual(state, "used", f"{frame} 读到 {state!r} / {raw!r}")
+            self.assertIn("后免费", raw)
 
     def test_ancestor_covers_three_forges(self):
         from mtbot import layout as LL
@@ -3669,7 +3706,8 @@ class ArenaBuyAttemptTests(unittest.TestCase):
         self.assertEqual(self.L.ARENA_BUY_CANCEL, (234, 828))
 
     def test_buy_requires_may_spend_attempt_kind(self):
-        self.assertIn('self.may_spend(ctx, "角斗场买 1 次挑战次数", None,', self.ARENA)
+        # 2026-11-20 审计 MAJOR：原来 cost=None 让预算闸失效，现在用弹窗实价过闸
+        self.assertIn('self.may_spend(ctx, "角斗场买 1 次挑战次数", cost,', self.ARENA)
         seg = self.ARENA[self.ARENA.index('"角斗场买 1 次挑战次数"'):]
         self.assertIn('kind="attempt"', seg[:200])
 
@@ -3967,11 +4005,27 @@ class ReconnectClickTests(unittest.TestCase):
         self.assertIn("reconnect_login_ok_ocr", self.UI)
 
     def test_fixed_point_is_only_a_fallback(self):
+        # 2026-11-19：固定点盲按改成「候选点逐个轻按 + 每次回看是否离开断线页」。
+        # 旧写法 diff=0.000 白赔 8 秒，还会在日志里记两条空点 WARN。
         seg = self.UI[self.UI.index("if st == State.RECONNECT_LOGIN:"):]
         seg = seg[:seg.index("def ")]
         i_ocr = seg.index("pos = self._reconnect_ok(")
-        i_fixed = seg.index("self.press(L.RECONNECT_LOGIN_OK, 200)")
-        self.assertLess(i_ocr, i_fixed)
+        i_cands = seg.index("for cand in L.RECONNECT_LOGIN_CANDS:")
+        self.assertLess(i_ocr, i_cands)
+        # 候选点循环里必须每次按完回看状态，不能一路盲按到底
+        self.assertIn("if self.state() != State.RECONNECT_LOGIN:", seg)
+        # 不允许再出现「OCR 失败就直接盲按固定点」的写法
+        self.assertNotIn("else:\n                self.press(L.RECONNECT_LOGIN_OK, 200)", seg)
+
+    def test_login_candidates_exist(self):
+        import re
+        m = re.search(r"RECONNECT_LOGIN_CANDS = (\(\(\d+, \d+\).*\))", self.LAYOUT)
+        self.assertIsNotNone(m, "layout.py 里缺少 RECONNECT_LOGIN_CANDS")
+        pts = re.findall(r"\((\d+), (\d+)\)", m.group(1))
+        self.assertGreaterEqual(len(pts), 3)
+        for x, y in pts:
+            self.assertTrue(100 <= int(x) <= 620, f"候选点 x={x} 越界")
+            self.assertTrue(600 <= int(y) <= 900, f"候选点 y={y} 越界")
 
     def test_box_covers_dialog_text(self):
         import re
@@ -4358,6 +4412,962 @@ class SoulBannerAndLossTests(unittest.TestCase):
         i_zero = src.index("罪魂之域：0 关（")
         self.assertLess(i_lose, i_zero, "连败必须先按跳过处理，再谈 FAIL")
         self.assertIn("今天一关都没打过", src)
+
+
+
+class DiamondPromptTests(unittest.TestCase):
+    """2026-11-15：「是否消耗 ?N 加速完成任务」钻石确认框。
+
+    真帧 tests/fixtures/bounty_diamond_prompt.png（720x1280）：
+      OCR(120,460,620,700) = 「是否消耗 10加速完成任务 / 当前拥有： 11541」
+      左红「取消」像素范围 x166~342 / y738~794 → 中心 (254,766)
+      右金「加速」金色块中心 (465,762)
+
+    为什么必须拦：第 42 轮 f42 21:35~21:36 悬赏接单时，第一行「接受」误触了详情
+    面板里的「加速完成」→ 弹出这个框 → 代码没认，紧接着给第二行点「接受」的
+    坐标 (565,762) 正好落在金「加速」上，真扣了 10 钻（11541→11531）。
+    """
+
+    FIX = HERE / "fixtures" / "bounty_diamond_prompt.png"
+
+    def test_layout_geometry_is_safe(self):
+        from mtbot import layout as LL
+        cx, cy = LL.DIAMOND_PROMPT_CANCEL
+        gx, gy = LL.DIAMOND_PROMPT_GOLD
+        self.assertLess(cx, gx, "「取消」必须在「加速」左边")
+        x0, y0, x1, y1 = LL.DIAMOND_PROMPT_GOLD_BOX
+        self.assertTrue(x0 <= gx <= x1 and y0 <= gy <= y1, "金钮中心应落在避让框里")
+        self.assertFalse(x0 <= cx <= x1, "「取消」不能被避让框圈进去")
+
+    def test_ocr_sees_the_prompt_and_the_cost(self):
+        from mtbot import layout as LL, textocr
+        if not self.FIX.exists() or not textocr.available():
+            self.skipTest("缺真帧或 OCR 不可用")
+        im = Image.open(self.FIX).convert("RGB")
+        txt = textocr.read_text(im, LL.DIAMOND_PROMPT_BOX).replace(" ", "")
+        self.assertTrue(any(k in txt for k in LL.DIAMOND_PROMPT_KEYS),
+                        f"真帧上应读到钻石确认框文本，实际 {txt!r}")
+        self.assertIn("10", txt, "弹窗里的花费钻石数应该读得到")
+
+    def test_bounty_accept_row_checks_prompt_everywhere(self):
+        import inspect
+        from mtbot.pages import BountyPage
+        src = inspect.getsource(BountyPage.accept_row)
+        self.assertGreaterEqual(src.count("dismiss_diamond_prompt"), 4,
+                                "接单流程：动手前 / 点接受后 / 关面板前 / 派遣后 都要查")
+        self.assertIn("加速完成", src)
+
+    def test_interruptions_handles_prompt_before_other_branches(self):
+        import inspect
+        from mtbot.ui import UI
+        src = inspect.getsource(UI.handle_interruptions)
+        self.assertIn("dismiss_diamond_prompt", src)
+        self.assertLess(src.index("self.dismiss_diamond_prompt(im)"),
+                        src.index("if vision.modal_dim(im):"),
+                        "钻石确认框必须先处理，不能落到「点空白」那支")
+
+    def test_no_blind_repress_on_modal_panel(self):
+        """点「接受」后若已弹出别的模态层，不能在同一坐标再点（那会命中「加速完成」）。"""
+        import inspect
+        from mtbot.pages import BountyPage
+        src = inspect.getsource(BountyPage.accept_row)
+        i = src.index("_accept2")
+        seg = src[max(0, i - 600):i]
+        self.assertIn("modal_dim", seg, "重试前必须确认没有模态层压着")
+
+    def test_never_clicks_the_gold_accel_button(self):
+        import inspect
+        from mtbot.ui import UI
+        src = inspect.getsource(UI.dismiss_diamond_prompt)
+        self.assertIn("DIAMOND_PROMPT_CANCEL", src)
+        self.assertNotIn("DIAMOND_PROMPT_GOLD,", src, "关框只许点左侧取消")
+
+
+class WeaponTaskTests(unittest.TestCase):
+    """2026-11-18 专武（专属武器）均匀升级：任务骨架 + 真帧判据。
+
+    真帧（tests/fixtures/，全部 720x1280，2026-11-18 01:37~01:49 实机截图）：
+      weapon_w5_cult.png       专武培养页：材料行「13050/19000」、等级 130、金色「升级」(358,1094)
+      weapon_weapon_detail.png 英雄详情：专武槽徽章「S+130级」（右侧那颗 S+ 是神器，别混）
+      weapon_w7_after.png      共鸣中的专武：OCR「专武共鸣中 无法升级」
+      weapon_tip_popup.png     材料不足点「升级」后弹的「熔火精华」物品浮层（整屏无金色按钮）
+
+    为什么这么写：玩家要求「专属武器均匀升级」，但这游戏的材料是全局一份（熔火精华），
+    材料不足时点「升级」不会升级、只会弹物品浮层。所以判据必须是
+    「先读本件的 拥有/需要 → 不足就不点 → 点了以后看等级数字变没变」，而不是点完就当成功。
+    """
+
+    FIX = HERE / "fixtures"
+
+    @staticmethod
+    def _task():
+        from mtbot.config import load
+        from mtbot.tasks.weapon import WeaponTask
+        return WeaponTask(load().task("weapon"))
+
+    def test_layout_upgrade_button_matches_measured_gold_band(self):
+        from mtbot import layout as LL
+        x, y = LL.WEAPON_UPGRADE
+        # 2026-11-18 实测金块 (358,1092,3281)：金像素 x240..476 / y1040..1132
+        self.assertTrue(240 <= x <= 476 and 1040 <= y <= 1132,
+                        f"「升级」按钮应在实测金块里，实际 {(x, y)}")
+        mx0, my0, mx1, my1 = LL.WEAPON_MATERIAL_BOX
+        self.assertNotIn(y, (my0, my1))
+        self.assertTrue(my1 <= 1094, "材料行在按钮上方")
+        tx, ty = LL.WEAPON_TIP_CLOSE
+        self.assertLess(ty, 378, "关浮层要点浮层上方的空白（浮层卡片上边界 y≈378）")
+
+    def test_material_reads_13050_of_19000(self):
+        """真帧 OCR 会把斜杠吞成空格；绝不能把「13050 19000」拼成 (1305019, 0)。"""
+        from mtbot import textocr
+        fix = self.FIX / "weapon_w5_cult.png"
+        if not fix.exists() or not textocr.available():
+            self.skipTest("缺真帧或 OCR 不可用")
+        t = self._task()
+        mat = t._material(Image.open(fix).convert("RGB"))
+        self.assertIsNotNone(mat, "培养页应读出「拥有/需要」")
+        have, need = mat
+        self.assertEqual((have, need), (13050, 19000), f"实际 {mat}")
+
+    def test_badge_level_from_real_detail_frame(self):
+        from mtbot import textocr
+        fix = self.FIX / "weapon_weapon_detail.png"
+        if not fix.exists() or not textocr.available():
+            self.skipTest("缺真帧或 OCR 不可用")
+        self.assertEqual(self._task()._level(Image.open(fix).convert("RGB")), 130)
+
+    def test_resonating_only_on_resonating_frame(self):
+        from mtbot import textocr
+        if not textocr.available():
+            self.skipTest("OCR 不可用")
+        t = self._task()
+        res = self.FIX / "weapon_w7_after.png"
+        cult = self.FIX / "weapon_w5_cult.png"
+        if res.exists():
+            self.assertTrue(t._resonating(Image.open(res).convert("RGB")),
+                            "共鸣中的专武要认出来（这种不给升）")
+        if cult.exists():
+            self.assertFalse(t._resonating(Image.open(cult).convert("RGB")),
+                             "普通培养页不能误判成共鸣")
+
+    def test_tip_popup_frame_reads_the_item_and_has_no_gold_button(self):
+        """材料不足的浮层：读得到「熔火精华」，且整屏没有任何金色按钮（点了也不花钱）。"""
+        from mtbot import layout as LL, textocr, vision
+        fix = self.FIX / "weapon_tip_popup.png"
+        if not fix.exists() or not textocr.available():
+            self.skipTest("缺真帧或 OCR 不可用")
+        im = Image.open(fix).convert("RGB")
+        txt = (textocr.read_text(im, LL.WEAPON_TIP_BOX) or "").replace(" ", "")
+        self.assertTrue(any(k in txt for k in LL.WEAPON_TIP_KEYS),
+                        f"应读到「熔火精华/专武升级所需要的经验」，实际 {txt!r}")
+        self.assertEqual(vision.gold_button_bands(im, (0, 300, 720, 1280)), [])
+
+    def test_material_is_checked_before_pressing_upgrade(self):
+        """先读材料再点：材料不足时绝不点「升级」，也绝不花钻。"""
+        import inspect
+        from mtbot.tasks.weapon import WeaponTask
+        src = inspect.getsource(WeaponTask._upgrade_one)
+        self.assertIn("材料", src)
+        self.assertIn("不足", src)
+        self.assertLess(src.index("材料"), src.index("ui.press(L.WEAPON_UPGRADE"),
+                        "材料判据必须早于点「升级」")
+        self.assertIn("dismiss_diamond_prompt", src)
+
+    def test_no_diamond_paths_in_source(self):
+        import inspect
+        from mtbot import tasks
+        from mtbot.tasks import weapon as wmod
+        src = inspect.getsource(wmod)
+        self.assertNotIn("DIAMOND_PROMPT_GOLD", src, "专武任务绝不点钻石金钮")
+        self.assertNotIn("购买", src)
+        self.assertNotIn("前往>>", src, "浮层里的「前往>>」会跳商店，不点")
+
+    def test_registered_and_enabled(self):
+        from mtbot.config import DEFAULT_TASKS
+        from mtbot.tasks import TASK_CLASSES
+        self.assertIn("weapon", TASK_CLASSES)
+        cfg = DEFAULT_TASKS["weapon"]
+        self.assertTrue(cfg.enabled, "专武任务默认开启")
+        self.assertGreaterEqual(cfg.params.get("max_try", 0), 1)
+
+
+
+class RankMilitaryPageTests(unittest.TestCase):
+    """军衔页到页锚（2026-11-18 f42 的第三条 WARN）。
+
+    事故：主城左下「累计登录/通关奖励」活动条下架后 (170,1070) 点了没反应，
+    旧码继续在**主城**上用 is_gold(360,875) 找「晋升」→ 命中主城金色装饰 →
+    白点 + WARN，任务仍报 OK（假成功）。现在点击前必须 at_page()。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PIL import Image
+        cls.Image = Image
+        cls.fixtures = Path(__file__).resolve().parent / "fixtures"
+
+    def _page(self):
+        from mtbot.pages import RankPage
+        # at_page(im) 只用 im，不需要 ui
+        return RankPage(None)
+
+    def _im(self, name):
+        return self.Image.open(str(self.fixtures / name)).convert("RGB")
+
+    def test_keys_do_not_collide_with_rank_board(self):
+        from mtbot import layout as L
+        self.assertIsNot(L.RANK_MILITARY_KEYS, L.RANK_PAGE_KEYS)
+        # 排行榜页的锚点里没有军事页的词，反之亦然
+        self.assertNotIn("排行榜", L.RANK_MILITARY_KEYS)
+        self.assertNotIn("军衔", L.RANK_PAGE_KEYS)
+        self.assertIn("切换徽标", L.RANK_MILITARY_KEYS)
+        self.assertIn("守护者之塔", L.RANK_MILITARY_KEYS)
+
+    def test_real_military_page_recognised(self):
+        page = self._page()
+        for name in ("rank_claimable.png", "rank_claimed.png"):
+            with self.subTest(name=name):
+                self.assertTrue(page.at_page(self._im(name)))
+
+    def test_main_city_is_not_military_page(self):
+        # 真因帧：主城（活动条已下架，画面里只有 排行榜/日常/邮件…）
+        self.assertFalse(self._page().at_page(self._im("rank_main_city_not_page.png")))
+
+    def test_guards_run_before_any_click(self):
+        src = (ROOT / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(src.count("if not self.at_page():"), 2)
+        promo = src.index("def promote(self) -> bool:")
+        guard = src.index("if not self.at_page():", promo)
+        click = src.index("self.ui.press(pos, 220)", promo)
+        self.assertLess(guard, click, "promote() 必须先判到页再点晋升")
+        rows = src.index("def claim_rows(self) -> int:")
+        guard2 = src.index("if not self.at_page():", rows)
+        self.assertLess(rows, guard2)
+        self.assertLess(guard2, src.index("RANK_CLAIM_ZONE", rows))
+
+    def test_rank_task_removed(self):
+        """2026-11-19 用户要求「军衔任务可以删除了」。
+
+        军衔页入口是轮换活动条，经常一整天都不出现；任务每天都只能说「进不去」。
+        按用户要求整体删除：类删掉、注册表删掉、config.json 删掉，避免它再占一整轮的时间。
+        """
+        src = (ROOT / "mtbot" / "tasks" / "reward.py").read_text(encoding="utf-8")
+        self.assertNotIn("class RankTask(", src)
+        import mtbot.tasks as T
+        self.assertNotIn("rank", T.TASK_CLASSES)
+        import mtbot.config as C
+        self.assertNotIn("rank", C.DEFAULT_TASKS)
+
+
+
+    def test_no_scroll_down_on_entry(self):
+        """用户要求「官阶奖励进页不要下滑」：军衔页里不许再出现 dev.scroll_up。
+
+        device.scroll_up = 手指上划 = 内容往上滚 = 看下面的条目（就是「下滑」），
+        旧码在 claim_rows/promote 开头各调了一次，进页就把顶部奖励行滑走。
+        """
+        src = (ROOT / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        start = src.index("class RankPage(Page):")
+        nxt = src.find("\nclass ", start)
+        end = len(src) if nxt < 0 else nxt   # 军衔页是文件最后一个类也行
+        body = src[start:end]
+        code = [ln for ln in body.splitlines() if not ln.strip().startswith("#")]
+        self.assertFalse([ln for ln in code if "scroll_up" in ln],
+                         "军衔页代码里不许再调 scroll_up（= 下滑）")
+        self.assertGreaterEqual(body.count("scroll_down"), 2)
+
+
+class IdleGreyButtonTests(unittest.TestCase):
+    """2026-11-18 03:18 空点 (235,1033)：今日剩余次数 0 时「获取更多」是灰化土黄。"""
+
+    def setUp(self):
+        from mtbot import layout as L
+        self.L = L
+
+    def test_grey_button_is_not_gold(self):
+        im = Image.open(FIX / "idle_grey_more.png").convert("RGB")
+        # 灰化按钮中心像素实测 (202,173,130)：不满足 is_gold 的 R>=212
+        self.assertFalse(vision.is_gold(im, *self.L.IDLE_MORE, r=16))
+        # 但邻居「领取收益」是真金（同帧 (489,1026) = (208,146,35)）
+        self.assertTrue(vision.is_gold(im, 489, 1015, r=12))
+
+    def test_grey_band_centroid_not_confirmed_by_gold_band_point(self):
+        im = Image.open(FIX / "idle_grey_more.png").convert("RGB")
+        # gold_bands_any 会看到一圈土黄像素，但质心不是金 → gold_band_point 必须给 None
+        self.assertIsNone(vision.gold_band_point(im, self.L.IDLE_MORE_BOX))
+        self.assertEqual(vision.gold_ratio(im, self.L.IDLE_MORE_BOX), 0.0)
+        # 同帧的真金「领取收益」gold_ratio 0.477，用来对照阈值
+        self.assertGreater(vision.gold_ratio(im, (400, 985, 580, 1080)), 0.30)
+
+    def test_remaining_regex_reads_today_form(self):
+        # 真帧 OCR 读到的是「今日剩余次数：0」，旧正则只认「免费次数：N」
+        import re
+        pat = re.compile(r"(?:免费|今日剩余)?次数[:：]?\s*(\d+)")
+        for txt in ("今日剩余次数：0", "剩余次数： 3", "免费次数：2", "今日剩余次数: 1"):
+            self.assertIsNotNone(pat.search(txt), txt)
+        self.assertEqual(pat.search("今日剩余次数：0").group(1), "0")
+        self.assertEqual(pat.search("免费次数：2").group(1), "2")
+
+    def test_idle_source_guards_grey_button(self):
+        src = (ROOT / "mtbot" / "tasks" / "daily.py").read_text(encoding="utf-8")
+        self.assertIn("gold_band_point(im, L.IDLE_MORE_BOX)", src)
+        self.assertIn("今日剩余次数 0", src)
+        # 旧兜底写法（bands 非空就当成金钮）必须消失
+        self.assertNotIn("bands = vision.gold_bands_any(im, self.L.IDLE_MORE_BOX)\n"
+                         "                if bands:\n"
+                         "                    paid_btn = True", src)
+
+
+class DragonBuyCurrencyTests(unittest.TestCase):
+    """巨龙买次数扣的不是钻石（弹窗「拥有 1518」vs 主城钻石 9148）。"""
+
+    def test_buy_attempt_returns_owned(self):
+        src = (ROOT / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        i = src.index("def buy_attempt")
+        body = src[i:i + 2200]
+        self.assertIn("拥有(\\d+)", body)          # 正则存在
+        self.assertIn("return True, cost, owned", body)
+        self.assertIn("return False, 0, None", body)
+
+    def test_events_reads_owned_and_splits_currency(self):
+        src = (ROOT / "mtbot" / "tasks" / "events.py").read_text(encoding="utf-8")
+        self.assertIn("opened, cost, owned = page.buy_attempt(ui)", src)
+        self.assertIn("abs(owned - d_now) > 20", src)
+        self.assertIn("这一单扣的不是钻石", src)
+        # 非钻购买不进钻石预算闸门、也不进钻石对账
+        self.assertIn("if is_diamond and not self.may_spend(", src)
+        self.assertIn("return int(cost) if is_diamond else -int(cost)", src)
+        self.assertIn("other_bought", src)
+
+    def test_non_diamond_buy_skips_diamond_reconcile(self):
+        src = (ROOT / "mtbot" / "tasks" / "events.py").read_text(encoding="utf-8")
+        i = src.index("spent_txt = \"\"")
+        tail = src[i:i + 900]
+        self.assertIn("if bought - other_bought:", tail)
+
+    def test_dragon_dialog_frame_text(self):
+        from mtbot import layout as L
+        from mtbot import textocr
+        frame = FIX / "dragon_buy_dlg.png"
+        if not frame.exists():
+            self.skipTest("今天购买次数已用完，抓不到购买框真帧")
+        im = Image.open(frame).convert("RGB")
+        txt = textocr.read_text(im, L.DRAGON_BUY_DLG_BOX).replace(" ", "")
+        if not textocr.available():
+            self.skipTest("OCR 不可用")
+        self.assertIn("购买1次挑战次数", txt)
+        m = __import__("re").search(r"拥有(\d+)", txt)
+        self.assertIsNotNone(m, txt)
+        self.assertLess(int(m.group(1)), 9000)     # 明显不是主城钻石那一档
+
+
+
+
+class TianshenRuneTests(unittest.TestCase):
+    """2026-11-18：天神传承「感叹号符文换装」+「印记背包分解」的判据与安全边界。
+
+    实机取证：助阵→天神传承(557,842)；四套页签 (189,770)/(304,771)/(417,771)/(532,771)；
+    六颗符文 水(187,295)/火(530,295)/土(118,469)/风(602,469)/木(188,641)/雷(530,641)；
+    带感叹号的符文上有红色角标；印记背包 (634,154) → 圆形「分解」(582,888) →
+    「快速选择」(228,988) → 「分解」(492,988) **立即执行、没有二次确认**。
+    """
+
+    def setUp(self):
+        from mtbot import layout as L
+        from mtbot.tasks.tianshen import TianshenTask
+        self.L = L
+        self.task = TianshenTask
+
+    def test_fixture_marks_the_badged_rune_only(self):
+        """真帧：只有土位那颗有红角标，其它五颗都没有。"""
+        from mtbot import vision
+        im = load("tianshen_badge_page")
+        L = self.L
+        hits = []
+        for i, (x, y) in enumerate(L.TIANSHEN_RUNES):
+            box = (x - L.TIANSHEN_RUNE_PAD, y - L.TIANSHEN_RUNE_PAD,
+                   x + L.TIANSHEN_RUNE_PAD, y + L.TIANSHEN_RUNE_PAD)
+            if vision.red_clusters(im, box):
+                hits.append(i)
+        self.assertEqual(hits, [2], f"期望只有土位(索引2)带角标，实际 {hits}")
+
+    def test_at_page_rejects_change_and_detail_panels(self):
+        """「更换」弹层 / 符文详情页也画着「印记背包」，不能被当成主页。"""
+        src = (HERE.parent / "mtbot" / "tasks" / "tianshen.py").read_text(encoding="utf-8")
+        i = src.index("    def _at_page(self")
+        seg = src[i:src.index("    def _badges(self")]
+        self.assertIn("镶嵌印记", seg)
+        self.assertIn("神力值", seg)
+        self.assertIn("印记背包", seg)
+        self.assertIn('return False', seg)
+
+    def test_decompose_has_no_confirm_and_needs_rank_guard(self):
+        """分解是「立即执行」，所以必须先过「阶数/传说」闸门。"""
+        src = (HERE.parent / "mtbot" / "tasks" / "tianshen.py").read_text(encoding="utf-8")
+        i = src.index("    def _decompose(self")
+        seg = src[i:src.index("    # ---------- 主流程 ----------")]
+        self.assertIn("BAG_QUICK", seg)
+        self.assertIn("BAG_GO", seg)
+        # 闸门必须早于按「快速选择」
+        self.assertLess(seg.index("BAG_SAFE_RANK"), seg.index("L.BAG_QUICK"))
+        self.assertLess(seg.index("BAG_PREMIUM"), seg.index("L.BAG_QUICK"))
+        # 空选/无可分解要早退，不许盲按「分解」
+        self.assertIn("BAG_EMPTY_KEYS", seg)
+
+    def test_no_diamond_or_purchase_paths(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "tianshen.py").read_text(encoding="utf-8")
+        for bad in ("DIAMOND_PROMPT_GOLD", "购买", "前往>>", "充值"):
+            self.assertNotIn(bad, src)
+
+    def test_decompose_screen_fixtures(self):
+        """分解页真帧：快速选择后出现「分解可得」，分解后弹「获得奖励」。"""
+        from mtbot import layout as L, textocr, vision
+        quick = load("tianshen_decompose_quick")
+        self.assertIn("印记分解", textocr.read_text(quick, (0, 150, 720, 240)))
+        self.assertIn("分解可得", textocr.read_text(quick, (120, 880, 620, 960)))
+        self.assertTrue(vision.is_gold(quick, *L.BAG_GO, r=18))
+        gain = load("tianshen_decompose_reward")
+        self.assertIn("获得奖励", textocr.read_text(gain, L.BAG_GAIN_BOX))
+
+    def test_registered_and_enabled(self):
+        from mtbot.config import DEFAULT_TASKS, load as load_cfg
+        self.assertIn("tianshen", DEFAULT_TASKS)
+        self.assertTrue(DEFAULT_TASKS["tianshen"].enabled)
+        cfg = load_cfg()
+        self.assertTrue(cfg.tasks["tianshen"].enabled)
+
+
+
+
+class QianchouTests(unittest.TestCase):
+    """2026-11-18：千抽福利是**轮换活动**（旧坐标 (280,290) 今天变成了赛前竞猜），
+    所以只能「按 OCR 找入口」，找到后也只点明确写「免费」的按钮。
+    """
+
+    def test_no_fixed_coordinate_assumption(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "qianchou.py").read_text(encoding="utf-8")
+        # 候选槽位是「找」用的列表，不允许直接当成「千抽福利」页面来点
+        self.assertIn("CITY_SLOTS", src)
+        self.assertIn("QIANCHOU_KEYS", src)
+        self.assertIn("千抽", src)
+        i = src.index("    def _find(self")
+        seg = src[i:src.index("    def _pick_horde")]
+        self.assertIn("_page_text", seg)
+        # 认不出就是「没找到」，不能瞎点
+        self.assertIn("return None, None", seg)
+
+    def test_pays_and_free_guards(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "qianchou.py").read_text(encoding="utf-8")
+        i = src.index("    def _free_draw(self")
+        seg = src[i:src.index("    def run(self, ctx)")]
+        self.assertIn("FREE_KEYS", seg)
+        # 必须先有「免费」字样才允许点金色按钮
+        self.assertLess(seg.index("FREE_KEYS"), seg.index("gold_button_bands"))
+        self.assertNotIn("SUMMON_TEN", src)          # 绝不点十连
+        self.assertNotIn("DIAMOND_PROMPT_GOLD", src)
+        self.assertIn("PAY_KEYS", src)               # 付费页立刻退出
+
+    def test_horde_picker_by_ocr(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "qianchou.py").read_text(encoding="utf-8")
+        self.assertIn("HORDE_KEYS", src)
+        self.assertIn("部落", src)
+
+    def test_registered_and_enabled(self):
+        from mtbot.config import DEFAULT_TASKS, load as load_cfg
+        self.assertIn("qianchou", DEFAULT_TASKS)
+        self.assertTrue(DEFAULT_TASKS["qianchou"].enabled)
+        self.assertTrue(load_cfg().tasks["qianchou"].enabled)
+
+
+
+
+class AssistUpgradeProofTests(unittest.TestCase):
+    """2026-11-18：第 44 轮「荣耀之书·辅助(65级)：升级 ×1」但等级没变 ——
+    材料不足窗弹一下就关，`_changed()` 把浮层残留当成升级。两处判据必须自证。
+    """
+
+    def _src(self):
+        return (HERE.parent / "mtbot" / "tasks" / "assist.py").read_text(encoding="utf-8")
+
+    def test_glory_book_requires_level_growth(self):
+        src = self._src()
+        i = src.index("    def _book(self, ui)")
+        seg = src[i:src.index("    def run(self, ctx:")]
+        # 复读等级 + 没变大就不计数
+        self.assertIn("after = self._levels(ui)", seg)
+        self.assertIn("now = after[idx]", seg)
+        self.assertIn("now is None or now <= lv", seg)
+        self.assertIn("tried.add(idx)", seg)
+        # 计数必须是「等级差」而不是 n（`_upgrade_loop` 的返回值）
+        self.assertIn("total += now - lv", seg)
+        self.assertNotIn("total += n\n", seg)   # 不再按「点了 n 次」计数
+
+    def test_upgrade_loop_double_frame_check(self):
+        src = self._src()
+        i = src.index("    def _upgrade_loop(self")
+        seg = src[i:src.index("class GloryBookTask")]
+        self.assertIn("assist_up_chk", seg)
+        # 第二次抓帧必须早于 done += 1
+        self.assertLess(seg.index("assist_up_chk"), seg.index("done += 1"))
+        self.assertIn("画面只是闪了一下", seg)
+
+    def test_artifact_parallel_log_uses_real_card_index(self):
+        src = self._src()
+        self.assertIn("ARTIFACT_CARDS.index(low_x)", src)
+        # 不允许再写死「先升 1 号」
+        self.assertNotIn("先升 1 号到", src)
+
+
+
+
+class LegendRewardTests(unittest.TestCase):
+    """2026-11-18（用户第 12 项）：传奇试炼「首通奖励」不自动发，必须手动领。
+    入口是主页底栏右侧页签（真帧 OCR：(631,1255) 写「首通奖励」）。
+    """
+
+    def setUp(self):
+        self._src = (HERE.parent / "mtbot" / "pages.py").read_text(encoding="utf-8")
+
+    def test_tab_coordinate_from_real_frame(self):
+        from mtbot import layout as L, textocr
+        fp = HERE / "fixtures" / "legend_page.png"
+        if not textocr.available():
+            self.skipTest("OCR 不可用")
+        im = Image.open(fp).convert("RGB")
+        lines = textocr.read_lines(im, (0, 1200, 720, 1280), min_score=0.35)
+        hits = [(t, c) for t, c, _b, _s in lines if "首通" in t.replace(" ", "")]
+        self.assertTrue(hits, f"底栏没读到「首通奖励」：{lines}")
+        t, c = hits[0]
+        self.assertLessEqual(abs(c[0] - L.LEGEND_REWARD_TAB[0]), 40)
+        self.assertLessEqual(abs(c[1] - L.LEGEND_REWARD_TAB[1]), 40)
+
+    def test_claim_only_presses_ocr_claim_text(self):
+        i = self._src.index("    def claim_rewards(self) -> int:")
+        seg = self._src[i:self._src.index("class TreePage")]
+        self.assertIn("LEGEND_REWARD_TAB", seg)
+        self.assertIn("LEGEND_CLAIM_TEXTS", seg)
+        # 点之前必须先 OCR 认出「领取」两个字
+        self.assertLess(seg.index("LEGEND_CLAIM_TEXTS"), seg.index("press(pos"))
+        # 不许碰挑战/页签外的按钮
+        for bad in ("LEGEND_GO", "LEGEND_RESULT_OK", "SOUL_CODEX_EXIT"):
+            self.assertNotIn(bad, seg)
+        # 没打开面板要退回主页，不能把面板当主页继续点
+        self.assertIn("not open", seg.replace("没打开", "not open"))
+
+    def test_task_reports_claimed(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "combat.py").read_text(encoding="utf-8")
+        i = src.index("class LegendTask")
+        seg = src[i:src.index("class TreeTask")]
+        self.assertIn("claim_rewards()", seg)
+        self.assertIn("claimed", seg)
+
+
+
+
+class RankSlotSearchTests(unittest.TestCase):
+    """2026-11-18：官阶/军衔入口是会轮换的活动条（11-09 在 (170,1070) 可进，
+    11-18 起消失）。旧码死记一个坐标 → 在主城上盲点 (360,875) 报假晋升。
+    现在必须：多候选槽位 + 每槽位都先 at_page() 认页 + 当天扫不到就记住别再扫。
+    """
+
+    def setUp(self):
+        self._src = (HERE.parent / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        self._seg = self._src[self._src.index("    def open_rank(self)"):
+                              self._src.index("    def open_trials(self)")]
+
+    def test_tries_multiple_slots(self):
+        self.assertIn("RANK_SLOTS = (", self._src)
+        self.assertIn("for pos in order:", self._seg)
+        self.assertIn("rank_slot:", self._seg)
+        # 至少 8 个候选位（活动条会换位置）
+        from mtbot.pages import MainCity
+        self.assertGreaterEqual(len(MainCity.RANK_SLOTS), 8)
+
+    def test_each_slot_is_verified_before_success(self):
+        # 点完必须 at_page() 复核，复核不过就回主城换下一个
+        i_press = self._seg.index("self.ui.press(pos")
+        i_check = self._seg.index("if page.at_page():", i_press)
+        self.assertLess(i_press, i_check)
+        self.assertIn("self.ui.ensure_main_city()", self._seg[i_check:])
+
+    def test_remembers_today_and_skips_rescan(self):
+        self.assertIn("rank_slots.json", self._src)
+        self.assertIn("swept", self._seg)
+        i = self._seg.index('cache.get("swept")')
+        j = self._seg.index("for pos in order:")
+        self.assertLess(i, j, "当天已扫过的短路必须在候选循环之前")
+        self.assertIn("time.strftime", self._seg)
+
+    def test_cache_written_both_outcomes(self):
+        self.assertIn('"ok": [pos[0], pos[1]]', self._seg)
+        self.assertIn('"ok": None', self._seg)
+        self.assertIn('"swept": True', self._seg)
+        # 两个分支都要写「什么时候扫的」，供 3 小时后再扫一次用
+        self.assertGreaterEqual(self._seg.count("swept_at"), 3)
+
+    def test_may_resweep_later_in_the_day(self):
+        """活动条可能中午/下午才上架，扫空不能等于「今天一整天都没有」。"""
+        from mtbot.pages import MainCity
+        self.assertGreater(MainCity.RANK_RESWEEP, 0)
+        self.assertIn("RANK_RESWEEP", self._seg)
+        i = self._seg.index('if (cache.get("swept")')
+        j = self._seg.index("for pos in order:")
+        self.assertLess(i, j, "短路必须在候选循环之前")
+
+
+class BountyEntryFallbackTests(unittest.TestCase):
+    """2026-11-18 第 48 轮：campaign 里接悬赏时 `press (654,495)` 落到 classify=unknown
+    的错页——旧码只对 DEPLOY/BATTLE 做回退，于是停在错页上第二次再点还是错页，
+    最后 `WARN 悬赏入口打不开`，任务里那步白丢。修法：等地图画完再找模板，
+    三次尝试，且「只要不是悬赏页就退回来」。
+    """
+
+    def setUp(self):
+        src = (HERE.parent / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        i = src.index("    def enter(self) -> bool:", src.index("class BountyPage"))
+        j = src.index("    def points(self, im)", i)
+        self.seg = src[i:j]
+
+    def test_waits_for_map_before_template_search(self):
+        i_wait = self.seg.index("self.ui.wait(1.2)")
+        i_find = self.seg.index('T.VI.find(im, "悬赏入口.png"')
+        self.assertLess(i_wait, i_find, "切到战役页后要先等地图画完再找入口")
+
+    def test_three_attempts(self):
+        self.assertIn("for attempt in range(3):", self.seg)
+
+    def test_unknown_landing_also_backs_out(self):
+        # 非悬赏页一律回退：兜底分支必须点 BACK
+        i_else = self.seg.index("            else:")
+        tail = self.seg[i_else:]
+        self.assertIn("self.ui.press(L.BACK", tail)
+        self.assertIn("MainCity(self.ui).ensure()", tail)
+
+    def test_no_state_nav_typo(self):
+        # State 里没有 NAV 成员（只有 NAV_PAGE），写错会在运行时 AttributeError
+        self.assertNotIn("State.NAV)", self.seg)
+        self.assertIn("State.NAV_PAGE", self.seg)
+
+
+class HubEnterOverlayTests(unittest.TestCase):
+    """2026-11-18：树任务收尾再进历练页时，点卡片没进页面 + 两次「列表里找不到卡片」。
+    多半是上一次点击弹了提示浮层把列表压暗，OCR 认不出卡片。修法：进循环先关浮层，
+    失败一次也关一次再重试。
+    """
+
+    def setUp(self):
+        src = (HERE.parent / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        i = src.index("    def enter(self, key: str) -> bool:")
+        j = src.index("    def _click_card(", i)
+        self.seg = src[i:j]
+
+    def test_dismisses_dialog_before_search(self):
+        i_cls = self.seg.index("vision.classify(pre) in (State.DIALOG, State.CONFIRM_DIALOG)")
+        i_hub = self.seg.index("if not vision.trials_hub(pre):")
+        self.assertLess(i_cls, i_hub, "要在找卡片之前先关掉压着的浮层")
+
+    def test_dismisses_after_failed_click(self):
+        i_warn = self.seg.index("没进到页面（第")
+        tail = self.seg[i_warn:]
+        self.assertIn("self.ui.press(L.BLANK", tail)
+
+    def test_three_attempts_and_target_check(self):
+        self.assertIn("for attempt in range(3):", self.seg)
+        self.assertIn("self._at_target(key, tries=8", self.seg)
+
+
+class TowerClaimHonestyTests(unittest.TestCase):
+    """2026-11-18 第 49 轮假成功审计：
+
+    1) 塔「每日奖励」：真帧 `logs/_twd0.png` 里 (360,678) `is_gold=True` 是面板金色描边，
+       按下去 diff=0.0，旧码照样 n += 1 并打「塔每日奖励已领取」→ 每轮虚报「领奖励 1」。
+    2) 塔「进度奖励」：只读滑动后那一帧，OCR 偶尔把「未达成」扫没了 → 明明没得领却报 WARN。
+    """
+
+    def setUp(self):
+        self.src = (HERE.parent / "mtbot" / "tasks" / "combat.py").read_text(encoding="utf-8")
+        i = self.src.index("    def _claim_rewards(self, ui) -> int:")
+        j = self.src.index("    @staticmethod", i)
+        self.seg = self.src[i:j]
+
+    def test_daily_uses_ocr_state_before_clicking(self):
+        i_state = self.seg.index('if "已领取" in flat:')
+        i_press = self.seg.index("ui.press((360, y)")
+        self.assertLess(i_state, i_press, "面板写着已领取就不该再去点")
+
+    def test_daily_requires_visible_change(self):
+        i_press = self.seg.index("ui.press((360, y)")
+        i_chk = self.seg.index("vision.diff_ratio(before, after", i_press)
+        i_inc = self.seg.index("n += 1", i_chk)
+        self.assertLess(i_chk, i_inc, "必须画面真的变了才计数")
+
+    def test_progress_counts_claimed_rows(self):
+        self.assertIn("def _progress_claimed", self.src)
+        i = self.seg.index("done = max(self._progress_undone(first)")
+        self.assertIn("self._progress_claimed", self.seg[i:])
+        # 两帧都要看（滑动前后）
+        self.assertIn("self._progress_undone(first)", self.seg)
+
+
+class DragonProgressPanelTests(unittest.TestCase):
+    """2026-11-18：打完一轮后第二次开「首通奖励」面板时 `press (103,377)` diff=0.000，
+    两条「空点」WARN。改成先认面板开着、点完必须 OCR 读到面板标题，否则如实跳过。
+    """
+
+    def setUp(self):
+        src = (HERE.parent / "mtbot" / "pages.py").read_text(encoding="utf-8")
+        i = src.index("    def prog_panel_open(self, im) -> bool:")
+        j = src.index("    def buy_attempt(self", i)
+        self.seg = src[i:j]
+        self.src = src
+
+    def test_panel_gate_before_badge_claim(self):
+        i_gate = self.seg.index("prog_panel_open(self.shot(")
+        i_claim = self.seg.index("claim_badge_icons")
+        self.assertLess(i_gate, i_claim, "先确认面板真的开着才去点角标")
+
+    def test_no_change_expectation(self):
+        # 盲点会触发空点补偿；这里必须是 expect="none"
+        for line in self.seg.splitlines():
+            if "L.DRAGON_PROGRESS_BTN" in line and "press" in line:
+                self.assertIn('expect="none"', line)
+
+    def test_panel_open_needs_body_text(self):
+        self.assertIn("首通奖励", self.seg)
+        self.assertIn("未达成", self.seg)
+
+
+class GuildRankPopupTests(unittest.TestCase):
+    """公会排位赛「敌阵信息」弹层：按钮文案会随对手状态变，必须按 OCR 文字点。
+
+    2026-11-18 事故链：
+      1. 弹层里未击败的对手写金「挑战」(359,917)，已击败的写金「扫荡奖励」
+         （同一格位置），次数用完后变成「▲ 点击空白处关闭 ▲」；
+      2. 旧码写死按 (358,916)，打到已击败的对手时会点「扫荡」，白耗一次挑战次数；
+      3. 真帧证据：tests/fixtures/grank_popup_fresh.png（「挑战奖励 / 击败可得 / 挑战」）
+         与 grank_popup_swept.png（「扫荡奖励 / 点击空白处关闭 / 挑战次数： 0/3」）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from mtbot import layout as L, textocr
+        cls.L = L
+        cls.textocr = textocr
+
+    def _lines(self, name, box):
+        from PIL import Image
+        im = Image.open(HERE / "fixtures" / name).convert("RGB")
+        return im, self.textocr.read_lines(im, box, min_score=0.4)
+
+    def test_fresh_popup_has_challenge_text(self):
+        L = self.L
+        im, lines = self._lines("grank_popup_fresh.png", L.GUILD_RANK_POPUP_BTN)
+        flat = "".join(t.replace(" ", "") for t, _c, _b, _s in lines)
+        self.assertIn("挑战", flat)
+        # 金块中心必须落在按钮框内（坐标证据：358,916）
+        from mtbot import vision
+        pt = vision.gold_band_point(im, L.GUILD_RANK_POPUP_BTN)
+        self.assertIsNotNone(pt)
+        self.assertLess(abs(pt[0] - 358), 40)
+        self.assertLess(abs(pt[1] - 916), 40)
+
+    def test_swept_popup_offers_sweep_not_challenge(self):
+        L = self.L
+        im, lines = self._lines("grank_popup_swept.png", L.GUILD_RANK_POPUP_BTN)
+        flat = "".join(t.replace(" ", "") for t, _c, _b, _s in lines)
+        self.assertNotIn("挑战", flat)
+        self.assertTrue("扫荡" in flat or "点击空白处关闭" in flat, flat)
+
+    def test_attack_reads_popup_text_before_pressing(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "guild_rank.py").read_text(
+            encoding="utf-8")
+        seg = src[src.index("def _attack("):src.index("def run(")]
+        self.assertIn("L.GUILD_RANK_POPUP_BTN", seg)
+        self.assertIn("GUILD_RANK_POPUP_SWEEP_KEYS", seg)
+        # 必须先判「没有挑战就关弹层返回」，再 press 挑战坐标
+        i_go = seg.index("ui.press(go")
+        i_none = seg.index("if go is None:")
+        self.assertLess(i_none, i_go)
+        # 不许再出现写死按 L.GUILD_RANK_GO（那正是点「扫荡」的位置）
+        self.assertNotIn("ui.press(L.GUILD_RANK_GO", seg)
+
+    def test_zero_attempts_skips_before_fight_loop(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "guild_rank.py").read_text(
+            encoding="utf-8")
+        self.assertIn("if left <= 0:", src)
+        self.assertLess(src.index("if left <= 0:"), src.index("for i in range(min(left,"))
+        self.assertIn("次已经用完", src)
+
+    def test_attempt_box_flattens_whitespace(self):
+        src = (HERE.parent / "mtbot" / "tasks" / "guild_rank.py").read_text(
+            encoding="utf-8")
+        seg = src[src.index("def _attempts("):src.index("def _closed(")]
+        self.assertIn('re.sub(r"\\s+", "", txt)', seg)
+
+
+class HonestyGuardTests(unittest.TestCase):
+    """2026-11-19 假成功审计：计数必须有证据（源码级回归）。"""
+
+    @staticmethod
+    def _src(rel):
+        return (HERE.parent / "mtbot" / "tasks" / rel).read_text(encoding="utf-8")
+
+    def test_campaign_fight_needs_battle_evidence(self):
+        src = self._src("daily.py")
+        seg = src[src.index("        fought = 0"):]
+        self.assertIn("pending = 0", seg)
+        # 进布阵页只记 pending
+        dep = seg[seg.index("if st == State.DEPLOY:"):]
+        dep = dep[:dep.index("ui.battle_finish")]
+        self.assertIn("pending += 1", dep)
+        self.assertNotIn("fought += 1", dep)
+        # 看到战斗/结算才结算 pending
+        self.assertIn("if pending:", seg)
+        self.assertIn("fought += pending", seg)
+        self.assertIn("State.BATTLE, State.RESULT_DEFEAT", seg)
+
+    def test_tavern_got_from_counter_delta(self):
+        src = self._src("tavern.py")
+        # 2026-11-20：卡片上第一个数是「还能请几次」→ 请客成功这个数变小，
+        # 所以差值方向反了：avail - after。
+        self.assertIn("grew = avail - after_m[0]", src)
+        # 主循环里不许自己 got += 1（只能靠前后读数差）
+        loop = src[src.index("for k in range(min(avail, 4)):"):]
+        loop = loop[:loop.index("im = ui.screen(\"tavern_after\")")]
+        self.assertNotIn("got += 1", loop)
+        # 读不到就记 0，不许按上限推算
+        self.assertIn("按 0 记（不虚报）", src)
+
+    def test_ancestor_free_needs_popup_or_countdown(self):
+        src = self._src("ancestor.py")
+        self.assertIn("st2, raw2 = self._free_state(after, free_box)", src)
+        idx = src.index("if got or st2 == \"used\":")
+        after = src[idx:]
+        self.assertLess(after.index("done.append(name)"), after.index("skipped.append(name)"))
+        self.assertIn("不算完成", src)
+
+    def test_forge_onekey_requires_change(self):
+        src = self._src("reward.py")
+        self.assertIn("vision.diff_ratio(before_px, im, L.FORGE_COST_BOX)", src)
+        self.assertNotIn("if cost0 and cost1 and cost0 == cost1:", src)
+        self.assertIn("gold_out = True", src)
+
+    def test_demon_reward_popup_needs_armed(self):
+        src = self._src("combat.py")
+        seg = src[src.index("        att = 0                # 2026-11-09"):]
+        self.assertIn("armed = False", seg)
+        pop = seg[seg.index("if page.maybe_reward_popup(im):"):]
+        pop = pop[:pop.index("if page.buff_dialog(im):")]
+        self.assertIn("if armed:", pop)
+        self.assertLess(pop.index("if armed:"), pop.index("wins += 1"))
+        self.assertIn("当残留浮层关掉（不计入通关）", pop)
+        # 2026-11-20 审计 MAJOR：连点（r == "same"）不再 arm，只剩布阵/战斗两条路
+        self.assertGreaterEqual(seg.count("armed = True"), 2)
+        i_same = seg.index('if r == "same":')
+        self.assertNotIn("armed = True", seg[i_same:i_same + 600])
+
+
+
+class TitleLoginFixTests(unittest.TestCase):
+    """2026-11-19 06:06 事故：登录页被判成 battle → 空点到「登录超时」。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from PIL import Image
+        from pathlib import Path
+        root = Path(__file__).resolve().parent / "fixtures"
+        cls.title_im = Image.open(root / "title_new_20261119.png").convert("RGB")
+        cls.frames = []
+        for name in ("daily_achieve.png", "assist_mark.png", "soul_panel.png",
+                     "bp_pay_dialog.png", "campaign_boss_panel.png", "main_city.png"):
+            p = root / name
+            if p.exists():
+                cls.frames.append((name, Image.open(p).convert("RGB")))
+
+    def test_new_title_frame_is_title(self):
+        from mtbot import vision
+        self.assertTrue(vision.title_screen(self.title_im))
+        self.assertEqual(vision.classify(self.title_im), vision.State.TITLE)
+
+    def test_gold_dialog_pages_are_not_title(self):
+        """金钮在 (360,1000) 的米色弹窗不许再被认成标题页（旧判据会认）。"""
+        from mtbot import vision
+        self.assertTrue(self.frames, "没有可比对的帧")
+        for name, im in self.frames:
+            with self.subTest(frame=name):
+                self.assertFalse(vision.title_screen(im), name)
+
+    def test_title_start_template_exists(self):
+        from pathlib import Path
+        p = Path(__file__).resolve().parent.parent / "templates" / "登录页_开始游戏.png"
+        self.assertTrue(p.exists())
+
+    def test_agree_and_start_coordinates(self):
+        from mtbot import layout as L
+        # 勾选框中心必须在协议文字左侧、且落在勾选框框内
+        self.assertTrue(L.TITLE_AGREE_BOX[0] <= L.TITLE_AGREE[0] <= L.TITLE_AGREE_BOX[2])
+        self.assertTrue(L.TITLE_AGREE_BOX[1] <= L.TITLE_AGREE[1] <= L.TITLE_AGREE_BOX[3])
+        self.assertLess(L.TITLE_AGREE[0], 152)
+        self.assertTrue(970 <= L.TITLE_START[1] <= 1035)
+
+    def test_tick_detected_on_new_frame(self):
+        from mtbot.ui import UI
+        self.assertTrue(UI._agree_ticked(None, self.title_im))
+
+    def test_ui_does_not_reclick_checked_agree(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent / "mtbot" / "ui.py").read_text(encoding="utf-8")
+        seg = src[src.index("if self._agree_ticked(shot):"):]
+        seg = seg[:seg.index("continue") + 8]
+        self.assertIn("标题页：协议已勾选，不重复点勾选框", seg)
+        self.assertIn("title_agree", seg)
+        self.assertLess(seg.index("self._agree_ticked(shot)"), seg.index("title_agree"))
+
+    def test_title_stuck_restarts_game(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent / "mtbot" / "ui.py").read_text(encoding="utf-8")
+        seg = src[src.index("self._title_stuck"):]
+        seg = seg[:seg.index("continue") + 8]
+        self.assertIn("restart_game()", seg)
+
+
+class LoadingBlackTests(unittest.TestCase):
+    """2026-11-19 06:54 事故：黑屏加载被判 UNKNOWN → 「没有可用出口」→ 整轮中止。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from PIL import Image
+        from pathlib import Path
+        root = Path(__file__).resolve().parent / "fixtures"
+        cls.black = Image.open(root / "loading_black_20261119.png").convert("RGB")
+        cls.frames = []
+        for name in ("main_city.png", "battle.png", "dungeon_list.png",
+                     "title_new_20261119.png", "tower_page.png"):
+            p = root / name
+            if p.exists():
+                cls.frames.append((name, Image.open(p).convert("RGB")))
+
+    def test_black_frame_is_loading(self):
+        from mtbot import vision
+        self.assertTrue(vision.loading_black(self.black))
+        self.assertEqual(vision.classify(self.black), vision.State.LOADING)
+
+    def test_normal_frames_are_not_loading(self):
+        from mtbot import vision
+        self.assertTrue(self.frames)
+        for name, im in self.frames:
+            with self.subTest(frame=name):
+                self.assertFalse(vision.loading_black(im), name)
+
+    def test_ensure_main_city_waits_then_restarts(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent / "mtbot" / "ui.py").read_text(encoding="utf-8")
+        self.assertIn("if st == State.LOADING:", src)
+        seg = src[src.index("if st == State.LOADING:"):]
+        seg = seg[:seg.index("State.MAIN_CITY_DIM") if "State.MAIN_CITY_DIM" in seg else 1200]
+        self.assertIn("time.sleep(3.0)", seg)
+        self.assertIn('restart_game(reason="黑屏加载卡住")', seg)
+        self.assertIn("黑屏加载", seg)
 
 
 if __name__ == "__main__":

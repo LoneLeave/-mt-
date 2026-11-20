@@ -19,7 +19,26 @@ from .base import BaseTask, TaskContext, TaskResult
 class _RewardTask(BaseTask):
     category = "reward"
 
-    def enter(self, ctx: TaskContext, pos, wait: float = 1.6, page: str = ""):
+    # 2026-11-19 审计 B3：titles.TITLES 里没有 mail/friend/welfare/forge 这几个键，
+    # 于是「只要不回到主城」就当进对了页 —— 活动横幅/别的建筑也会被放行，随后继续点
+    # 固定坐标。这里给这几个任务加「页头/页签文字」锚点：((ROI, (关键词...)), ...)，
+    # 任一 ROI 里命中任一关键词即算进对页；OCR 不可用时返回 None（无法判断，放行）。
+    PAGE_ANCHORS: tuple = ()
+
+    def _page_anchored(self, im):
+        if not self.PAGE_ANCHORS or not textocr.available():
+            return None
+        for box, words in self.PAGE_ANCHORS:
+            try:
+                txt = textocr.read_text(im, box).replace(" ", "")
+            except Exception:  # noqa: BLE001
+                continue
+            if txt and any(w in txt for w in words):
+                return True
+        return False
+
+    def enter(self, ctx: TaskContext, pos, wait: float = 1.6, page: str = "",
+              cands: tuple = ()):
         """点主城图标进入界面；如果画面还是主城（图标换位/活动下架）就放弃。
 
         给了 page（标题键，见 titles.TITLES）时还校验「真的进了目标页」：
@@ -28,7 +47,63 @@ class _RewardTask(BaseTask):
         （日志里表现为「批量升星 0 次」）。
         """
         ui = ctx.ui
+        self._enter_reason = "page"
         if not MainCity(ui).ensure():
+            self._enter_reason = "home"
+            return None
+        self._clear_overlay(ui)
+        if cands:
+            # 2026-11-19：主城图标会整体上移/换位（邮件实测 (85,1005) 已失效），
+            # 逐个候选点试，点完用「页标题/页锚」确认真的进了目标页才算成功。
+            for cand in cands:
+                before = ui.screen(f"{self.name}_candb")
+                # expect="none"：这里自己用「点后是不是还在主城」判定，被吞掉的点击
+                # 会在下面补点救回来，不需要 ui.press 再报一条「空点」WARN（第 68 轮实测）。
+                ui.press(cand, 250, expect="none",
+                         label=f"{self.name}_cand:{cand[0]},{cand[1]}")
+                ui.wait(wait)
+                im = ui.screen(self.name)
+                if vision.classify(im) == State.MAIN_CITY:
+                    # 2026-11-19 第 65 轮：邮件任务在「游戏刚重开、刚回主城」的 8 秒内
+                    # 点 (74,909) 整屏一点没动（diff=0.000，4 个补偿点也全空），
+                    # 同一个点在设备空闲时点是能正常打开邮件页的 —— 这是主城 UI
+                    # 还没接输入（隐形 loading），不是图标换位。所以「画面完全没动」
+                    # 时等一会儿把同一个候选点再按一次，别急着换下一个。
+                    if vision.diff_ratio(before, im, (0, 0, 720, 1280)) < 0.01:
+                        ui.wait(2.5)
+                        ui.press(cand, 250, expect="none",
+                                 label=f"{self.name}_candretry:{cand[0]},{cand[1]}")
+                        ui.wait(wait)
+                        im = ui.screen(self.name)
+                    if vision.classify(im) == State.MAIN_CITY:
+                        continue
+                if page:
+                    if titles.on_page(im, page):
+                        return im
+                else:
+                    ok = self._page_anchored(im)
+                    if ok is not False:
+                        if ok:
+                            log.info(f"  {self.name}: 候选点 {cand} 进对了页")
+                        return im
+                ui.press(L.BACK, 250, expect="none")
+                ui.wait(1.0)
+                MainCity(ui).ensure()
+                self._clear_overlay(ui)
+            # 全部候选点都没进页：最后再给主城一次机会（UI 刚起来时最常见的假失败）
+            ui.wait(3.0)
+            if MainCity(ui).ensure():
+                self._clear_overlay(ui)
+                ui.press(pos, 250, expect="none", label=f"{self.name}_lasttry")
+                ui.wait(max(wait, 2.0))
+                im = ui.screen(f"{self.name}_last")
+                if vision.classify(im) != State.MAIN_CITY:
+                    ok = self._page_anchored(im)
+                    if ok is not False:
+                        log.info(f"  {self.name}: 补点入口 {pos} 进对了页")
+                        return im
+            log.warn(f"  {self.name}: {len(cands)} 个候选入口都没进到目标页，跳过本任务")
+            self._enter_reason = "page"
             return None
         ui.press(pos, 250)
         ui.wait(wait)
@@ -36,6 +111,15 @@ class _RewardTask(BaseTask):
         if vision.classify(im) == State.MAIN_CITY:
             log.warn(f"  {self.name}: 入口没打开（图标可能换位），跳过本任务")
             return None
+        if not page:
+            ok = self._page_anchored(im)
+            if ok is False:
+                log.warn(f"  {self.name}: 入口 {pos} 进的不是目标页（页头/页签文字都对不上），"
+                         f"退回主城跳过本任务")
+                ui.press(L.BACK, 250, expect="none")
+                ui.wait(1.0)
+                MainCity(ui).ensure()
+                return None
         if page and not titles.on_page(im, page):
             got = titles.identify(im) or "没认出来"
             log.warn(f"  {self.name}: 入口 {pos} 进的不是「{page}」页（标题识别：{got}），"
@@ -46,6 +130,36 @@ class _RewardTask(BaseTask):
             return None
         return im
 
+    def _clear_overlay(self, ui) -> bool:
+        """进页前把压在主城上的浮层关掉（2026-11-19）。
+
+        `logs/_f61.log` 09:59 邮件任务：4 个候选图标点下去全都没打开邮件页，
+        随后还报「回不到主城」。当时画面停在主城但上面压着一层浮层
+        （`vision.modal_dim` 为真），点击全被浮层吃掉。这里先点空白关一层。
+        """
+        closed = False
+        for _ in range(2):
+            im = ui.screen(f"{self.name}_pre")
+            if not (vision.modal_dim(im) or vision.item_popup(im)):
+                return closed
+            ui.press(L.BLANK, 150, label=f"{self.name}_pre_blank", expect="none")
+            ui.wait(0.9)
+            closed = True
+        return closed
+
+    def _enter_failed(self, label: str = "") -> TaskResult:
+        """`enter()` 返回 None 时该报什么（2026-11-19）。
+
+        `logs/_f61.log` 09:59：邮件页 4 个候选入口都没打开（画面停在主城/被浮层挡着），
+        旧码把这些一律写成 `fail("回不到主城")` —— 既是假失败（人已经在主城），
+        又会让整轮多一条 FAIL。现在按原因分开：真回不到主城才 fail，
+        「入口没打开目标页」按真状态跳过。
+        """
+        if getattr(self, "_enter_reason", "page") == "home":
+            return TaskResult.fail("回不到主城")
+        return TaskResult.skip(f"进不去{label or self.title}（入口没打开目标页）",
+                               {"noop_ok": True})
+
     def back(self, ctx: TaskContext):
         ui = ctx.ui
         ui.press(L.BACK, 250, expect="none")
@@ -54,14 +168,23 @@ class _RewardTask(BaseTask):
 
 
 class MailTask(_RewardTask):
+    # 2026-11-19 真帧（logs/_pm2_74_909.png，720×1280）：
+    #   邮件页是**盖在主城上的面板**，顶部 (0,0,720,200) 仍是主城 HUD（角色名/VIP），
+    #   面板标题「邮件」在 (360, 248)；底部 y≈1053 是「一键删除」，y≈1143 是
+    #   「普通邮件 / 系统邮件」页签，只有真有可领邮件时才出现「一键领取 / 全部领取」。
+    #   旧的页头锚点框 (0,0,720,200) 永远读不到「邮件」，底部又只认领取钮
+    #   → 明明进了邮件页也被判「没进到目标页」（`logs/_f61.log` 09:59 那次 FAIL 的根因）。
+    PAGE_ANCHORS = (((0, 180, 720, 320), ("邮件",)),
+                    ((0, 980, 720, 1200), ("一键领取", "全部领取", "一键删除",
+                                           "普通邮件", "系统邮件")))
     name = "mail"
     title = "邮件"
 
     def run(self, ctx: TaskContext) -> TaskResult:
         ui = ctx.ui
-        im = self.enter(ctx, L.ICON_MAIL, 1.4)
+        im = self.enter(ctx, L.ICON_MAIL, 1.4, cands=getattr(L, "ICON_MAIL_CANDS", ()))
         if im is None:
-            return TaskResult.fail("回不到主城")
+            return self._enter_failed("邮件页")
         claimed = 0
         stale = 0
         for _ in range(8):
@@ -106,33 +229,12 @@ class MailTask(_RewardTask):
         return TaskResult(True, f"邮件领取 {claimed} 轮", {"rounds": claimed})
 
 
-class RankTask(_RewardTask):
-    name = "rank"
-    title = "军衔"
-
-    def run(self, ctx: TaskContext) -> TaskResult:
-        ui = ctx.ui
-        if not MainCity(ui).ensure():
-            return TaskResult.fail("回不到主城")
-        page = MainCity(ui).open_rank()
-        rows = 0
-        promoted = 0
-        # 2026-11-03：原来的顺序是「先领奖再晋升」——晋升解锁的新奖励永远领不到。
-        # 改成「晋升 → 领奖」循环，每次升阶后立刻回收官阶奖励。
-        for _ in range(3):
-            if not page.promote():
-                break
-            promoted += 1
-            rows += page.claim_rows()
-        rows += page.claim_rows()
-        self.back(ctx)
-        return TaskResult(True, f"军衔领奖 {rows} 行，晋升 {promoted} 次",
-                          {"rows": rows, "promoted": promoted})
-
-
 class FriendTask(_RewardTask):
     name = "friend"
     title = "好友送礼"
+    # 2026-11-19 真帧：页头「好友[区服]名字 在线…」，页脚「好友数量：94/100 今日领取：19/20」
+    PAGE_ANCHORS = (((0, 60, 720, 300), ("好友", "今日领取", "赠送")),
+                    ((0, 1000, 720, 1220), ("今日领取", "好友数量")))
 
     @staticmethod
     def _claimed(im):
@@ -153,13 +255,14 @@ class FriendTask(_RewardTask):
         ui = ctx.ui
         im = self.enter(ctx, L.ICON_FRIEND, 1.4)
         if im is None:
-            return TaskResult.fail("回不到主城")
+            return self._enter_failed("好友页")
         # 2026-11-08：「赠送领取」是一键的（点一次 0/20 → 18/20），旧版盲点 3 次里
         # 有 2 次是纯空点（4 个补偿点都没反应，白赔 8s），而且结果串骗人。
         prev = self._claimed(im)
         got = prev[0] if prev[0] >= 0 else 0
         total = prev[1] if prev[1] >= 0 else 0
         tries = 0
+        blind_taps = 0
         if total and got >= total:
             # 2026-11-08 实测：送满后「赠送领取」仍然是金色，旧码照点一次，
             # 按钮毫无反应 → press 的 diff 校验白赔 8s（4 个补偿点全不中）。
@@ -188,15 +291,19 @@ class FriendTask(_RewardTask):
                 got, total = now
                 prev = now
             else:
-                got = max(got, i + 1)
+                # 2026-11-19 审计：这里原来 `got = max(got, i + 1)`，即读不到
+                # 「今日领取 N/20」时就按点击次数当领取数 —— 纯虚报。
+                # 现在只保留上一次真读到的数，读数失败的次数单独记。
+                blind_taps += 1
+                log.info("  好友送礼：这一下之后读不到「今日领取 N/20」，不拿点击次数当领取数")
         ui.press(L.FRIEND_CLOSE, 200, expect="none")
         ui.wait(0.9)
         MainCity(ui).ensure()
         if total:
             return TaskResult(True, f"好友送礼：今日领取 {got}/{total}（点 {tries} 次）",
                               {"claimed": got, "total": total, "taps": tries})
-        return TaskResult(True, f"好友赠送/领取 {got} 次（点 {tries} 次）",
-                          {"claimed": got, "taps": tries})
+        return TaskResult(True, f"好友赠送/领取 {got} 次（点 {tries} 次，其中 {blind_taps} 次读数失败没算领取）",
+                          {"claimed": got, "taps": tries, "blind_taps": blind_taps})
 
 
 class WelfareTask(_RewardTask):
@@ -210,6 +317,9 @@ class WelfareTask(_RewardTask):
     只对免费页操作——英雄集结（集结达标）、双倍签到（每日签到）、周末补给、
     终身福利；其余充值/兑换页一律不碰。
     """
+    # 2026-11-19 真帧：底栏页签「宝库/双倍签到/连续充值/终身福利/萌新指南」，页头是当期活动文案
+    PAGE_ANCHORS = (((0, 1150, 720, 1270), ("宝库", "双倍签到", "连续充值", "终身", "萌新指南")),
+                    ((0, 60, 720, 260), ("累充", "签到", "福利", "礼包", "领取")))
 
     name = "welfare"
     title = "福利"
@@ -339,10 +449,15 @@ class WelfareTask(_RewardTask):
         """按完一次领取：如果弹出「获得奖励」浮层（整屏变暗）就点空白关掉。"""
         after = ui.screen(name)
         if vision.darkened(before, after):
+            # 「获得奖励」浮层：关掉它，但浮层本身不算领取证据（2026-11-19 审计 TOP8）
             ui.press(L.BLANK, 150, expect="none")
             ui.wait(0.8)
+            after = ui.screen(name + "_clean")
+        # 领取成功的证据：右侧按钮列里那颗金钮不见了/变灰，或该列明显变化
+        left_gold = vision.gold_button_bands(after, L.WELFARE_CLAIM_SCAN)
+        if not left_gold:
             return True
-        return not vision.similar(before, after)
+        return vision.diff_ratio(before, after, L.WELFARE_CLAIM_SCAN) >= 0.015
 
     def _claim_gold_column(self, ui, label: str, limit: int = 6) -> int:
         """在右侧按钮列里找金色「领取」逐个点（标签「前往」是土黄色，不会误点）。"""
@@ -353,6 +468,23 @@ class WelfareTask(_RewardTask):
             if not bands:
                 break
             cx, cy, _ = bands[0]
+            # 2026-11-20 审计 MAJOR：原来只按「金色」抓第一个金带就点，当期该列若出现
+            # 金色「前往/购买」就是真实付费敞口。现在要求 OCR 在这一行读到「领取」。
+            said = None
+            if textocr.available():
+                try:
+                    rows = textocr.read_lines(im, L.WELFARE_CLAIM_SCAN, min_score=0.5)
+                except Exception:            # noqa: BLE001
+                    rows = []
+                for text, center, _bb, _sc in rows:
+                    if "领取" in text and "已领取" not in text \
+                            and abs(center[0] - cx) <= 150 and abs(center[1] - cy) <= 45:
+                        said = text.strip()
+                        break
+            if said is None:
+                log.info(f"  福利·{label}：金色按钮那一行读不到「领取」字样"
+                         f"（可能已领/是前往），本轮不点")
+                break
             if not ui.press((cx, cy), 220):
                 break                       # 2026-11-05：金色按钮已失效，别在原点空点
             ui.wait(1.5)
@@ -422,9 +554,9 @@ class WelfareTask(_RewardTask):
             if not targets:
                 break
             for pos in targets:
-                if not ui.press(pos, 220, label=f"signin:{pos[0]}", expect="none"):
-                    claimed.add(pos)
-                    continue
+                # 2026-11-19 审计：`expect="none"` 恒返回 True，旧写法 `if not press(...)`
+                # 是永不执行的死分支（看着像保护，其实没有）。这里老实点一下再判证据。
+                ui.press(pos, 220, label=f"signin:{pos[0]}", expect="none")
                 ui.wait(1.6)
                 if self._tapped(ui, im):
                     n += 1
@@ -476,8 +608,9 @@ class WelfareTask(_RewardTask):
             if not targets:
                 break
             pos = targets[0]
-            if not ui.press(pos, 220, label=f"weekend:{pos[0]}", expect="none"):
-                break                       # 2026-11-05：按钮点击无反应即停
+            # 2026-11-19 审计：`expect="none"` 恒 True，旧的 `if not press(...): break` 是死分支；
+            # 「点了没反应」由下面的 _tapped（画面证据）判，不再靠 press 返回值。
+            ui.press(pos, 220, label=f"weekend:{pos[0]}", expect="none")
             ui.wait(1.5)
             if not self._tapped(ui, im):
                 log.info(f"  福利·周末补给：点了「领取」({pos[0]},{pos[1]}) 但画面没变，"
@@ -514,9 +647,8 @@ class WelfareTask(_RewardTask):
             else:
                 log.info("  福利·终身福利：底部写着「已领取」，今天没有可领的")
                 return 0
-        if not ui.press(pos, 220, label="welfare_lifetime", expect="none"):
-            log.warn("  福利·终身福利：按钮点击无反应，停手")
-            return 0
+        # 2026-11-19 审计：`expect="none"` 恒 True，旧 `if not press(...)` 是死分支。
+        ui.press(pos, 220, label="welfare_lifetime", expect="none")
         ui.wait(1.5)
         if not self._tapped(ui, im):
             # 2026-11-09 假成功审计：旧码把 _tapped 的返回值丢掉、恒返回 1
@@ -649,7 +781,7 @@ class WelfareTask(_RewardTask):
         ui = ctx.ui
         im = self.enter(ctx, L.ICON_WELFARE, 1.8)
         if im is None:
-            return TaskResult.fail("回不到主城")
+            return self._enter_failed("福利页")
         claimed = 0
         done: set[str] = set()
 
@@ -909,11 +1041,22 @@ class BattlePassTask(_RewardTask):
                 log.info(f"  勇者计划：本轮 {len(lines)} 个按钮里没有「领取」"
                          f"（都是前往/已领取，说明这些任务还没做完或已领）")
                 return []
-        # 只有 OCR 不可用（或框里一个字都没读到）才用固定行中心 + 金色判据兜底
+        # 只有 OCR 读不到按钮文字时才用固定行中心 + 金色判据兜底。
+        # 2026-11-20 审计 MAJOR：「前往」也是金带，盲点会跳到角斗场/挂机页 —— 所以
+        # 兜底还要求同帧在任务行区域里读得到「任务/前往」之一，否则一行都不点。
+        extra = []
         for y in L.BP_TASK_YS:
             if vision.is_gold(im, L.BP_TASK_BTN_X, y, r=18):
-                out.append((L.BP_TASK_BTN_X, y))
-        return out
+                extra.append((L.BP_TASK_BTN_X, y))
+        if extra and textocr.available():
+            try:
+                whole = textocr.read_text(im, L.BP_CLAIM_ZONE) or ""
+            except Exception:            # noqa: BLE001
+                whole = ""
+            if "任务" not in whole and "前往" not in whole and "领取" not in whole:
+                log.info("  勇者计划：读不到任务行文字，固定行兜底也不点（防止跳到角斗场/挂机）")
+                return []
+        return extra
 
     def _bp_recover(self, ui) -> bool:
         """画面跑偏（误点「前往」跳到角斗场/挂机页等）后回到战令任务页。
@@ -1230,14 +1373,24 @@ class RelicTask(_RewardTask):
         im = ui.screen("relic_ok")
         if not RelicTask._relic_confirm_open(im):
             return False
+        used = None
         for pos in L.RELIC_CONFIRM_FALLBACKS:
             if vision.is_gold(im, *pos, r=16):
                 ui.press(pos, 220)
                 ui.wait(1.6)
-                return True
-        # 认到「取消/确定」但金钮没认到（字压在上面）：用实测中心兜底
-        ui.press(L.RELIC_CONFIRM, 220)
-        ui.wait(1.6)
+                used = pos
+                break
+        if used is None:
+            # 认到「取消/确定」但金钮没认到（字压在上面）：用实测中心兜底
+            ui.press(L.RELIC_CONFIRM, 220)
+            ui.wait(1.6)
+        # 2026-11-19 假成功审计（audit2 TOP1）：点掉确认框本身不算证据，
+        # 必须复核它真的消失了——否则点偏/材料不足弹回原位时上层会记成升级成功。
+        again = ui.screen("relic_ok_after")
+        if RelicTask._relic_confirm_open(again):
+            log.info(f"  圣物：点了「确定」{used or L.RELIC_CONFIRM} 后确认框还开着"
+                     f"（点偏或条件不满足弹回），不算成功")
+            return False
         return True
 
     @staticmethod
@@ -1397,7 +1550,7 @@ class RelicTask(_RewardTask):
         ui = ctx.ui
         im = self.enter(ctx, L.BLD_RELIC, 1.8)
         if im is None:
-            return TaskResult.fail("回不到主城")
+            return self._enter_failed("圣物页")
         if textocr.available():
             head = self._relic_head(im)
             if head and not any(k in head for k in L.RELIC_PAGE_ANCHORS):
@@ -1409,6 +1562,7 @@ class RelicTask(_RewardTask):
                 return TaskResult.fail("进不去圣物页（入口被活动横幅挡住或图标换位）")
 
         ups = stars = bonds = bless = 0
+        blind_ups = 0
 
         # 1) 升级页：一键升级（红点=有可升级的）；成功后红点会消失
         if not self._switch_tab(ui, L.RELIC_TAB_UP, "up"):
@@ -1429,8 +1583,20 @@ class RelicTask(_RewardTask):
                 log.info("  一键升级：弹「材料不足/获取途径」，本页不再点")
                 break
             if self._confirm(ui):        # 有确认框，点掉了
-                ups += 1
-                log.info(f"  一键升级：确认框已点掉，算 1 次（材料 {before}）")
+                # 2026-11-19 假成功审计：确认框点掉本身不算证据，要看材料进度
+                ui.wait(1.2)
+                after_c = self._relic_res(ui.screen("relic_up3"))
+                if before and after_c and after_c != before:
+                    ups += 1
+                    log.info(f"  一键升级：确认框已点掉，材料 {before} → {after_c}，算 1 次")
+                elif before is None and after_c is None:
+                    # 2026-11-19 假成功审计（audit2 TOP6）：材料前后都读不到时不再凭
+                    # 「确认框点掉了」记账——那正是最容易失败的一轮。单列 blind_ups，
+                    # 让报告里能看出「有 N 次没取到证」。
+                    blind_ups += 1
+                    log.info("  一键升级：确认框点掉了，但前后材料都读不到 → 记 1 次未取证（不计入升级数）")
+                else:
+                    log.info(f"  一键升级：确认框点掉了但材料没变（{before} → {after_c}），不计入")
                 continue
             ui.wait(1.3)
             after = self._relic_res(ui.screen("relic_up2"))
@@ -1546,9 +1712,11 @@ class RelicTask(_RewardTask):
         ui.wait(0.6)
 
         self.back(ctx)
+        extra = f"（另有 {blind_ups} 次未取证，未计入）" if blind_ups else ""
         return TaskResult(True,
-                          f"圣物：升级 {ups} / 升星 {stars} / 羁绊 {bonds} / 祝福 {bless}",
-                          {"ups": ups, "stars": stars, "bonds": bonds, "bless": bless})
+                          f"圣物：升级 {ups} / 升星 {stars} / 羁绊 {bonds} / 祝福 {bless}{extra}",
+                          {"ups": ups, "stars": stars, "bonds": bonds, "bless": bless,
+                           "blind_ups": blind_ups})
 
 
 class StarUpTask(_RewardTask):
@@ -1570,7 +1738,7 @@ class StarUpTask(_RewardTask):
         ui = ctx.ui
         im = self.enter(ctx, L.BLD_STAR, 1.6, page="hero_star")
         if im is None:
-            return TaskResult.fail("进不去英雄升星页（入口被活动横幅挡住或图标换位）")
+            return self._enter_failed("英雄升星页")
         n = 0
         for _ in range(3):
             im = ui.screen("star")
@@ -1693,6 +1861,9 @@ class EquipmentTask(_RewardTask):
       2. 没有自动弹的话：强化页点「一键50级」→ 升星页点「一键升星」→ 回强化页再点，
          循环到「一键50级」价格变红（金币不足）且升星窗显示「没有符合条件的装备」。
     """
+    # 2026-11-19 真帧：标题「铁匠铺」在左上 (60,25) 一带，底栏页签「总览/强化/升星」
+    PAGE_ANCHORS = (((0, 0, 460, 90), ("铁匠铺",)),
+                    ((0, 1150, 720, 1270), ("总览", "强化", "升星")))
 
     name = "equipment"
     title = "装备强化/升星"
@@ -1730,7 +1901,7 @@ class EquipmentTask(_RewardTask):
         ui = ctx.ui
         im = self.enter(ctx, L.BLD_FORGE, 2.0)
         if im is None:
-            return TaskResult.fail("回不到主城")
+            return self._enter_failed("铁匠铺")
 
         enh = stars = 0
 
@@ -1745,12 +1916,13 @@ class EquipmentTask(_RewardTask):
                 # 2026-11-09 假成功审计 M16：点完要复核 —— 弹窗老板样（按钮还金、
                 # 画面几乎没变）说明这一下没升成，不能计数
                 after = ui.screen("forge_star_after")
-                still = (vision.forge_star_dialog(after) == "ready"
-                         and vision.is_gold(after, *L.FORGE_STAR_POPUP, r=16))
-                if still and vision.similar(before, after):
-                    log.info("  进店升星窗：点了「升星」但弹窗没变（按钮仍金），不计入")
+                st_after = vision.forge_star_dialog(after)
+                # 2026-11-19 假成功审计：弹窗必须消失才算升星成功（同主循环判据）
+                if st_after != "none":
+                    log.info(f"  进店升星窗：点了「升星」后弹窗还在（{st_after}），不计入")
                 else:
                     stars += 1
+                    log.info("  进店升星窗：一键升星成功 ×1（弹窗已关闭）")
             self._close_dialog(ui)
 
         # 2) 强化 ⇄ 升星 交替，直到两头都到上限
@@ -1768,10 +1940,11 @@ class EquipmentTask(_RewardTask):
                     # 被判空点 → 赔 4 个补偿点 ≈8s，还把 (360,1095) 记成怪状态。
                     # 改成点击数不校验，「这次强化真发生了没」看价格文字变没变。
                     cost0 = textocr.read_text(im, L.FORGE_COST_BOX) if textocr.available() else ""
+                    before_px = im
                     ui.press(L.FORGE_ENHANCE_50, 250, label="forge_enhance_50", expect="none")
                     ui.wait(2.2)
                     im = ui.screen("forge_enh2")
-                    if vision.confirm_dialog(im):          # 万一弹了确认框
+                    if vision.dialog_confirm(im):          # 万一弹了确认框（modal_dim 判据）
                         if vision.is_gold(im, 360, 760, r=16):
                             ui.press((360, 760), 220)
                             ui.wait(1.6)
@@ -1780,8 +1953,17 @@ class EquipmentTask(_RewardTask):
                             ui.press(L.BLANK, 150, expect="none")
                     self._guard_tooltip(ui)
                     cost1 = textocr.read_text(im, L.FORGE_COST_BOX) if textocr.available() else ""
-                    if cost0 and cost1 and cost0 == cost1:
-                        log.warn(f"  第 {cycle} 轮强化：点了一键50级但价格没变（{cost0}），停")
+                    # 2026-11-19 假成功审计 C4：OCR 不可用时 cost0/cost1 都是空串，
+                    # 旧码 `if cost0 and cost1 and cost0 == cost1` 恒假 → 每轮盲加 15 次。
+                    # 现在：能读文字就看文字变没变；读不到就退回「价格区像素变没变」。
+                    if cost0 and cost1:
+                        moved = cost0 != cost1
+                        why = f"价格 {cost0!r} → {cost1!r}"
+                    else:
+                        moved = vision.diff_ratio(before_px, im, L.FORGE_COST_BOX) >= 0.01
+                        why = "OCR 不可用，按价格区像素变化判定"
+                    if not moved:
+                        log.warn(f"  第 {cycle} 轮强化：点了一键50级但没有变化（{why}），停")
                         gold_out = True
                         break
                     enh += 1
@@ -1794,21 +1976,24 @@ class EquipmentTask(_RewardTask):
                 ui.wait(1.8)
                 st = vision.forge_star_dialog(ui.screen("forge_star"))
                 if st == "ready":
-                    before = ui.screen("forge_star_before2")
                     ui.press(L.FORGE_STAR_POPUP, 250)
                     ui.wait(2.6)
                     # 2026-11-09 假成功审计 M16：同 M15，点完必须有证据
                     after = ui.screen("forge_star_after2")
-                    still = (vision.forge_star_dialog(after) == "ready"
-                             and vision.is_gold(after, *L.FORGE_STAR_POPUP, r=16))
-                    if still and vision.similar(before, after):
-                        log.info(f"  第 {cycle} 轮升星：点了「升星」但弹窗没变"
-                                 f"（按钮仍金），不计入")
+                    st_after = vision.forge_star_dialog(after)
+                    # 2026-11-19 假成功审计：只有弹窗**消失**才算升星成功。
+                    # 弹窗还在（ready=按钮仍金 / locked=按钮灰）说明没升动或材料不足。
+                    if st_after != "none":
+                        if st_after == "locked":
+                            log.info(f"  第 {cycle} 轮升星：弹窗还在且按钮变灰（材料不足），不计入")
+                        else:
+                            log.info(f"  第 {cycle} 轮升星：点了「升星」但弹窗没变"
+                                     f"（按钮仍金），不计入")
                         star_out = True
                     else:
                         stars += 1
                         star_out = False
-                        log.info(f"  第 {cycle} 轮升星：一键升星成功 ×1")
+                        log.info(f"  第 {cycle} 轮升星：一键升星成功 ×1（弹窗已关闭）")
                     self._close_dialog(ui)
                 else:
                     star_out = True
@@ -1982,12 +2167,30 @@ class HeroLevelTask(_RewardTask):
                 ui.wait(1.4)
                 im = ui.screen("hero_adv2")
                 if vision.hero_break_dialog(im):
+                    # 2026-11-20 审计 CRITICAL：原来点完确认就 acted=True 写「进阶成功」，
+                    # 不看预览框有没有关、等级/上限有没有变 —— 一晚上能连写 20 条假成功。
                     ui.press(L.HERO_BREAK_CONFIRM, 260)
                     ui.wait(2.1)
+                    after2 = ui.screen("hero_adv_after_confirm")
+                    preview_gone = not vision.hero_break_dialog(after2)
+                    lv2, _ = self._level(after2)
+                    said_ok = False
+                    if textocr.available():
+                        try:
+                            flat2 = (textocr.read_text(after2, L.HERO_ADV_TIP_BOX) or "").replace(" ", "")
+                        except Exception:            # noqa: BLE001
+                            flat2 = ""
+                        said_ok = any(k in flat2 for k in ("进阶成功", "上限提升", "突破"))
                     ui.press(L.HERO_AFTER_BLANK, 180, expect="none")     # 关「进阶成功」浮层
                     ui.wait(0.9)
-                    acted = True
-                    log.info(f"  进阶成功（{before} 级，上限提升）")
+                    if preview_gone and (said_ok or (lv2 is not None and lv2 != before)):
+                        acted = True
+                        log.info(f"  进阶成功（原 {before} 级；证据：预览框已关"
+                                 f"{'、' + flat2[:12] if said_ok else ''}）")
+                    else:
+                        log.info(f"  进阶：确认后没拿到「已进阶」证据（预览框"
+                                 f"{'还在' if not preview_gone else '已关'}，"
+                                 f"等级 {before}→{lv2}），不记这次进阶")
                     break
                 if vision.item_popup(im):
                     log.info(f"  进阶材料不足（当前 {lv} 级），关闭获取途径窗")

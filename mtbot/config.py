@@ -45,7 +45,7 @@ class RuntimeConfig:
     state_file: str = "logs/state.json"
     tap_ms: int = 220           # 本作 50ms tap 经常不触发，统一用长按
     keep_screenshots: int = 300
-    max_task_minutes: int = 40  # 单个任务的最长运行时间，防止死循环
+    max_task_minutes: int = 20  # 单个任务的最长运行时间，防止死循环（任务可用 params.timeout_minutes 单独覆盖）
     allow_diamonds: bool = True   # 2026-11-10 用户规则开启；真正花在哪由 diamond_kinds 白名单决定
     # 2026-11-10 用户规则：「除了抽奖之外，钻石只用来买挑战次数，其余地方禁止使用钻石」。
     # 这条白名单是硬闸门 —— 不在里面的类别一律不花钻（may_spend 会拒）。
@@ -97,13 +97,16 @@ DEFAULT_TASKS: dict[str, TaskConfig] = {
     "ancestor": TaskConfig(True, 16, {"free_only": True}),
         "tavern": TaskConfig(True, 17, {"buy_attempts": 2}),
         "guild_rank": TaskConfig(True, 48, {"max_fights": 3}),
+    # 专武（专属武器）均匀升级：只花游戏内材料，材料不足时点「升级」只会弹物品浮层。
+    "weapon": TaskConfig(True, 12, {"max_try": 3}),
+        "tianshen": TaskConfig(True, 26, {}),
+        "qianchou": TaskConfig(True, 28, {}),
     "goblin": TaskConfig(True, 82, {"max_occupy": 9, "layers": 10}),
     "guild_trial": TaskConfig(True, 78, {"times": 3, "buy_attempt": True, "buy_cost": 20}),
     "beast": TaskConfig(True, 81, {"times": 5}),
     "campaign": TaskConfig(True, 80, {"max_fights": 30}),
     # 奖励
     "mail": TaskConfig(True, 1, {}),
-    "rank": TaskConfig(True, 2, {}),
     "friend": TaskConfig(True, 3, {}),
     "welfare": TaskConfig(True, 4, {}),
     "claim": TaskConfig(True, 88, {}),
@@ -133,7 +136,7 @@ DEFAULT_TASKS: dict[str, TaskConfig] = {
 # 预设：名字 -> 任务名列表（None 表示全部）
 PROFILES: dict[str, list[str] | None] = {
     "all": None,
-    "reward": ["mail", "rank", "friend", "welfare", "claim", "rank_board", "bp",
+    "reward": ["mail", "friend", "welfare", "claim", "rank_board", "bp",
                "bounty", "merchant", "idle", "shop", "donate"],
     "upgrade": ["relic", "star", "equipment", "glory_book", "inherit", "artifact",
                 "pet", "assist_mark", "collection", "hero_bond", "hero_level", "forge"],
@@ -141,7 +144,7 @@ PROFILES: dict[str, list[str] | None] = {
                "goblin", "guild_trial", "beast", "campaign"],
     "daily": ["claim", "idle", "forge", "shop", "donate", "guild_trial", "beast", "goblin",
               "bounty", "campaign", "dungeon", "soul"],
-    "full": ["mail", "rank", "friend", "welfare", "bp", "hero_level",
+    "full": ["mail", "friend", "welfare", "bp", "hero_level",
              "relic", "star", "equipment", "glory_book", "inherit", "artifact",
              "pet", "assist_mark", "collection", "hero_bond", "rank_board", "merchant",
              "claim", "idle", "forge", "shop", "donate", "guild_trial", "beast", "goblin",

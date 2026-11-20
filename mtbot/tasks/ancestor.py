@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from .. import layout as L
 from .. import log, textocr
 from ..pages import MainCity
@@ -34,12 +36,33 @@ class AncestorTask(BaseTask):
     category = "reward"
 
     @staticmethod
-    def _free(im, box) -> bool:
+    def _free_state(im, box) -> tuple[str, str]:
+        """读「免费」标签的真实状态 —— 返回 (状态, 原文)。
+
+        状态取值：
+          - `"free"`    ：今天还免费，可以点「一次」；
+          - `"used"`    ：文案是「16时6分后免费」这种倒计时 → 今天免费已用掉，
+                          **再点就是花券/钻**，必须跳过（2026-11-18 真帧：三台
+                          今天全是这种倒计时，旧代码把倒计时里的「免费」当成
+                          「还免费」，在唤灵台上白点了一次「召唤一次」）；
+          - `"unknown"` ：没读到任何「免费」字样。
+        """
         try:
-            txt = textocr.read_text(im, box) or ""
-        except Exception:
-            return False
-        return "免费" in txt
+            txt = (textocr.read_text(im, box) or "").replace(" ", "")
+        except Exception:      # noqa: BLE001
+            return "unknown", ""
+        if not txt:
+            return "unknown", ""
+        if "免费" not in txt:
+            return "unknown", txt
+        m = re.search(r"(\d{1,2})时(\d{1,2})分后免费", txt)
+        if m:
+            return "used", f"{m.group(1)}时{m.group(2)}分后免费"
+        if re.search(r"\d+天\d+时后免费", txt):
+            return "used", txt
+        if "后免费" in txt or "后可免费" in txt:
+            return "used", txt
+        return "free", txt
 
     @staticmethod
     def _at_page(im) -> bool:
@@ -77,7 +100,7 @@ class AncestorTask(BaseTask):
             MainCity(ui).ensure()
             return TaskResult.fail("进不去先祖魂画页")
 
-        done, skipped = [], []
+        done, skipped, used = [], [], []
         for name, tab, free_box, btn, what in TABS:
             if not self._ensure_page(ui):
                 break
@@ -85,8 +108,14 @@ class AncestorTask(BaseTask):
                 ui.press(tab, 220, label=f"ancestor_tab_{name}", expect="none")
                 ui.wait(1.8)
             im = ui.screen(f"ancestor_{name}")
-            if not self._free(im, free_box):
-                log.info(f"  先祖魂画·{name}（{what}）：没有「免费」标签（今天已用或未开放），不点")
+            state, raw = self._free_state(im, free_box)
+            if state != "free":
+                if state == "used":
+                    log.info(f"  先祖魂画·{name}（{what}）：今天免费已用掉（{raw}），"
+                             f"再点就是花券/钻，不点")
+                    used.append(f"{name}:{raw}")
+                else:
+                    log.info(f"  先祖魂画·{name}（{what}）：没读到「免费」标签，不点")
                 skipped.append(name)
                 continue
             log.info(f"  先祖魂画·{name}（{what}）：读到「免费」，点一次")
@@ -94,8 +123,17 @@ class AncestorTask(BaseTask):
             ui.wait(2.8)
             after = ui.screen(f"ancestor_{name}_after")
             got = self._got(after)
-            log.info(f"  先祖魂画·{name}：免费{what}完成（结果弹窗={got}）")
-            done.append(name)
+            # 2026-11-19 假成功审计 C3：以前点了就 done.append，不看结果。
+            # 现在要两条证据之一：①弹出结果弹窗；②「免费」标签变成「N时N分后免费」倒计时
+            # （说明这次免费真的被消耗掉了）。
+            st2, raw2 = self._free_state(after, free_box)
+            if got or st2 == "used":
+                log.info(f"  先祖魂画·{name}：免费{what}完成（结果弹窗={got}，免费标签→{raw2 or '无'}）")
+                done.append(name)
+            else:
+                log.info(f"  先祖魂画·{name}：点了「免费{what}」但既没弹结果、免费标签也没变倒计时，"
+                         f"不算完成")
+                skipped.append(name)
             if got:
                 ui.press(L.BACK, 220, label="ancestor_pop_close", expect="none")
                 ui.wait(1.6)
@@ -104,7 +142,11 @@ class AncestorTask(BaseTask):
         ui.wait(1.4)
         MainCity(ui).ensure()
         if not done:
+            if used:
+                return TaskResult(True, f"跳过：先祖魂画三台今天免费都已用掉（{used[0]}，别再点）",
+                                  {"forged": 0, "skipped": skipped, "used": used, "noop_ok": True})
             return TaskResult(True, f"跳过：先祖魂画三台今天都没有免费（{', '.join(skipped) or '无'}）",
                               {"forged": 0, "skipped": skipped, "noop_ok": True})
-        return TaskResult(True, f"先祖魂画：三台免费各一次（{'/'.join(done)}；跳过 {len(skipped)} 台）",
+        tail = f"；跳过 {len(skipped)} 台（{', '.join(skipped)}）" if skipped else ""
+        return TaskResult(True, f"先祖魂画：三台免费手工点 {len(done)} 台（{'/'.join(done)}）{tail}",
                           {"forged": len(done), "done": done, "skipped": skipped})

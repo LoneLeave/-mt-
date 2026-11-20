@@ -62,14 +62,27 @@ class Page:
         现在改成盲点 + 前后帧对比：画面真的变了才算点到。
         """
         before = self.shot(f"{label}_b")
+        # 2026-11-19 假成功审计（audit2 TOP7）：以前「整屏有任意像素变化」就算领到，
+        # 浮层弹出/飘字/行高亮都会满足。现在只看这一行按钮条带：
+        #   ① 该行金钮由金变非金（领完变灰/变字），或
+        #   ② 条带本身明显变化（出现「已领取」等）。
+        w, h = before.size
+        band = (max(0, pos[0] - 70), max(0, pos[1] - 26),
+                min(w, pos[0] + 70), min(h, pos[1] + 26))
+        was_gold = vision.gold_ratio(before, band) >= 0.25
         self.ui.press(pos, 220, label=label, expect="none")
         self.ui.wait(1.6)
         after = self.shot(f"{label}_a")
-        changed = vision.darkened(before, after) or not vision.similar(before, after)
-        if changed:
+        if vision.darkened(before, after):
+            # 「获得奖励」浮层压着 —— 先关掉再判，浮层本身不是领取证据
             self.ui.press(L.BLANK, 150, expect="none")
             self.ui.wait(0.9)
-        return changed
+            after = self.shot(f"{label}_a2")
+        band_moved = vision.diff_ratio(before, after, band) >= 0.015
+        gold_off = was_gold and vision.gold_ratio(after, band) < 0.25
+        if not (band_moved or gold_off):
+            log.info(f"  {label}：点 {pos} 后这一行按钮条带没有变化（那里不是领取钮/条件未达成），不算领到")
+        return bool(band_moved or gold_off)
 
     def __init__(self, ui: UI):
         self.ui = ui
@@ -138,11 +151,84 @@ class MainCity(Page):
         MainCity(self.ui).open_building(L.BLD_SHOP)
         return ShopPage(self.ui)
 
+    # 官阶/军衔页的入口是**会轮换的活动条**（2026-11-09 在 (170,1070) 能进，
+    # 2026-11-18 起该位置什么都不出现）。所以按候选槽位逐个试，每个都先用
+    # RankPage.at_page() 认页，认不出来就回主城换下一个 —— 绝不盲点。
+    # 扫空之后隔多久允许再扫一次（活动条可能中午/下午才上架）
+    RANK_RESWEEP = 3 * 3600.0
+    RANK_SLOTS = (
+        (170, 1070),   # 2026-11-09 生效过的「累计登录/通关奖励」活动条
+        (170, 980), (170, 900), (170, 1160),
+        (240, 1070), (240, 980),
+        (280, 290), (360, 200), (200, 290), (470, 290), (524, 175), (175, 189),
+    )
+
+    @staticmethod
+    def _rank_cache_path():
+        from pathlib import Path
+
+        return Path(__file__).resolve().parents[1] / "logs" / "rank_slots.json"
+
+    def _rank_cache(self) -> dict:
+        """记忆今天扫过哪些槽位、哪个槽位能用（轮换横幅，逐日重扫一次就够）。"""
+        import json
+
+        try:
+            raw = json.loads(self._rank_cache_path().read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:      # noqa: BLE001
+            return {}
+
+    def _rank_cache_save(self, data: dict) -> None:
+        import json
+
+        try:
+            p = self._rank_cache_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:      # noqa: BLE001
+            pass
+
     def open_rank(self) -> "RankPage":
+        """进官阶/军衔页。入口是会轮换的活动条（2026-11-09 在 (170,1070)，
+        2026-11-18 起消失），所以：先试上次成功的槽位 → 再按候选表逐个试 →
+        每天都扫一次，当天扫不到就记住，别在同一个「今天没有」上耗 2 分钟。
+        """
         self.ui.ensure_main_city()
-        self.ui.press(L.ICON_RANK_BAR, 250)
-        self.ui.wait(2.0)
-        return RankPage(self.ui)
+        page = RankPage(self.ui)
+        if page.at_page():
+            return page
+        today = time.strftime("%Y-%m-%d")
+        cache = self._rank_cache()
+        if cache.get("date") != today:
+            cache = {"date": today, "ok": None, "swept": False}
+        order = list(self.RANK_SLOTS)
+        last_ok = cache.get("ok")
+        if isinstance(last_ok, (list, tuple)) and len(last_ok) == 2:
+            order = [tuple(last_ok)] + [p for p in order if tuple(p) != tuple(last_ok)]
+        # 2026-11-18：活动条是**后来才可能上架**的（比如 12:00 的双倍/累计登录），
+        # 所以「今天扫过一次」不能当成「今天一整天都没有」——原来那版扫空之后
+        # 一整天都不再看，傍晚横幅真出来了也永远进不去。现在改成过了
+        # RANK_RESWEEP 秒（3 小时）就允许再扫一遍。
+        swept_at = float(cache.get("swept_at") or 0)
+        if (cache.get("swept") and not last_ok
+                and time.time() - swept_at < self.RANK_RESWEEP):
+            log.info("  军衔：今天已经扫过主城所有候选活动位（%d 分钟前），官阶入口还没出现，跳过"
+                     % int(max(0, time.time() - swept_at) // 60))
+            return page
+        for pos in order:
+            self.ui.press(pos, 220, label=f"rank_slot:{pos[0]},{pos[1]}", expect="none")
+            self.ui.wait(1.5)
+            if page.at_page():
+                log.info(f"  军衔：在 ( {pos[0]}, {pos[1]} ) 的活动条进到官阶页")
+                self._rank_cache_save({"date": today, "ok": [pos[0], pos[1]],
+                                       "swept": True, "swept_at": time.time()})
+                return page
+            self.ui.ensure_main_city()
+        self._rank_cache_save({"date": today, "ok": None, "swept": True,
+                               "swept_at": time.time()})
+        log.info("  军衔：主城所有候选活动位都没有「官阶/军衔」入口（轮换横幅今天没出）")
+        return page
 
     def open_trials(self) -> "TrialsHub":
         self.ui.ensure_main_city()
@@ -274,20 +360,40 @@ class TrialsHub(Page):
         if self._at_target(key):
             return True
         for attempt in range(3):
-            if not vision.trials_hub(self.ui.screen("hub_open")):
+            pre = self.ui.screen("hub_open")
+            # 2026-11-18 第 48 轮实测：树任务收尾再进历练页时，点卡片没进页面、
+            # 接着两次「列表里找不到卡片」——多半是上一次点击弹了提示浮层
+            # （「今日次数已用尽/条件不满足」之类）把列表压暗了，OCR 就认不出卡片。
+            # 所以进循环先把压着的浮层关掉，失败一次也关一次再重试。
+            if vision.classify(pre) in (State.DIALOG, State.CONFIRM_DIALOG):
+                self.ui.press(L.BLANK, 150, expect="none")
+                self.ui.wait(0.9)
+                pre = self.ui.screen("hub_open2")
+            if not vision.trials_hub(pre):
                 MainCity(self.ui).tab(L.TAB_TRIAL)
-                self.ui.wait(1.2)
+                # 2026-11-19 第 55 轮实测：点完历练页签 1.2s 时列表还在过场
+                # （classify=unknown），第一屏就报「不在历练列表」，白丢一次重试。
+                self.ui.wait(2.2)
+                for _ in range(3):
+                    if vision.trials_hub(self.ui.screen("hub_wait")):
+                        break
+                    self.ui.wait(1.0)
             if key == "tree":
                 self.to_bottom()
             else:
                 self.to_top()
             # 一屏一屏往下找卡片（最多 5 屏）；OCR 认不出来时第一屏就用固定坐标兜底
             if not self._click_card(key, pos, probe_fixed=(attempt == 0)):
-                log.warn(f"  历练：列表里没找到「{key}」的卡片（第 {attempt + 1}/3 次）")
+                # 只有最后一次还找不到才算异常；前两次多是过场/浮层，重试即可
+                (log.warn if attempt >= 2 else log.info)(
+                    f"  历练：列表里没找到「{key}」的卡片（第 {attempt + 1}/3 次）")
                 continue
             if self._at_target(key, tries=8, gap=0.6):
                 return True
             log.warn(f"  历练：点了「{key}」卡片但没进到页面（第 {attempt + 1}/3 次）")
+            # 没进页面时把可能弹出的提示浮层关掉，别让下一轮对着压暗的列表找卡片
+            self.ui.press(L.BLANK, 150, expect="none")
+            self.ui.wait(0.8)
         return False
 
     def _click_card(self, key: str, fixed, probe_fixed: bool = False) -> bool:
@@ -295,9 +401,13 @@ class TrialsHub(Page):
         for page in range(5):
             im = self.ui.screen(f"hub_card_{key}")
             if not vision.trials_hub(im):
-                # 不在历练列表（战斗/结算/主城）时不要认卡片：OCR 会把界面文字当标题
-                log.info(f"  历练：当前不在历练列表（{key}），放弃认卡片")
-                return False
+                # 2026-11-19：过场帧也会判「不在历练列表」，先等一帧再放弃
+                self.ui.wait(1.4)
+                im = self.ui.screen(f"hub_card_{key}b")
+                if not vision.trials_hub(im):
+                    # 不在历练列表（战斗/结算/主城）时不要认卡片：OCR 会把界面文字当标题
+                    log.info(f"  历练：当前不在历练列表（{key}），放弃认卡片")
+                    return False
             c = self._card_pos(im, key)
             if c is not None:
                 # 卡片中心可能压字，只发不校验（补偿点会把列表滚走）
@@ -491,6 +601,106 @@ class LegendPage(Page, FightMixin):
         self.ui.press(L.LEGEND_GO, 250)
         self.ui.wait(2.5)
         return vision.is_green(self.shot("legend_dep"), *L.DEPLOY, r=18)
+
+    # ---- 首通奖励（2026-11-18 新增；用户 m20058 第 12 项） ----
+    def claim_rewards(self) -> int:
+        """打开底栏「首通奖励」页签，把达成但未领的档位领掉。
+
+        2026-11-18 真帧（logs/screens/legend_legend_reward_12.png）：点页签并不是
+        换页，而是叠一层「奖励预览」浮层（标题在 (357,163)），每行左边是首通条件
+        （「首次通关背叛之翼精英V」），右边 x≈530 是状态文字，只有三种取值：
+        `未达标` / `已领取` / `领取`。所以：
+          - 只点**状态文字恰为「领取」**的那一行（绝不点条件文字本身，那是列表说明）；
+          - 顺便把 `已领取 N 档 / 未达标 N 档` 记进日志，避免「什么都没做」看不出原因。
+        """
+        from . import textocr
+
+        if not self.at_page():
+            return 0
+        self.ui.press(L.LEGEND_REWARD_TAB, 250, label="legend_reward_tab", expect="none")
+        self.ui.wait(2.0)
+        im = self.shot("legend_reward")
+        if not textocr.available():
+            log.info("  传奇试炼：OCR 不可用，首通奖励这次不领")
+            self.ui.press(L.BACK, 200, expect="none")
+            self.ui.wait(1.2)
+            return 0
+        try:
+            head = textocr.read_text(im, (0, 90, 720, 220)) or ""
+        except Exception:      # noqa: BLE001
+            head = ""
+        if "奖励预览" not in head and "首通" not in head and "奖励" not in head:
+            log.info(f"  传奇试炼：点「首通奖励」没打开面板（读到「{head.strip()[:14]}」），不领")
+            self.ui.press(L.BACK, 200, expect="none")
+            self.ui.wait(1.2)
+            return 0
+
+        def survey(img):
+            """返回 (待领坐标列表, 已领取数, 未达标数)。"""
+            pend, got, bad = [], 0, 0
+            for t, c, _b, _s in textocr.read_lines(img, L.LEGEND_REWARD_BOX, min_score=0.4):
+                flat = t.replace(" ", "")
+                if flat in L.LEGEND_CLAIM_TEXTS:
+                    pend.append(c)
+                elif flat in L.LEGEND_CLAIMED_KEYS:
+                    got += 1
+                elif flat == "未达标":
+                    bad += 1
+            return pend, got, bad
+
+        try:
+            pend, got, bad = survey(im)
+        except Exception:      # noqa: BLE001
+            pend, got, bad = [], 0, 0
+        n = 0
+        missed = 0
+        for _ in range(8):
+            if not pend:
+                break
+            pos = pend[0]
+            before = im
+            self.ui.press(pos, 200, label="legend_claim", expect="none")
+            self.ui.wait(1.8)
+            after = self.shot("legend_reward_after")
+            gained = vision.item_popup(after) or vision.modal_dim(after)
+            if gained:
+                self.ui.press(L.HERO_BLANK, 150, expect="none")
+                self.ui.wait(1.0)
+                after = self.shot("legend_reward_close")
+            got2 = got
+            try:
+                pend, got2, bad = survey(after)
+            except Exception:      # noqa: BLE001
+                pend = []
+            # 2026-11-20 审计 MAJOR：旧判据「像素差 ≥0.002 或出了弹窗」就算领到一档，
+            # 而高亮/数字过渡动画也会让像素动。现在必须有「已领取」计数真的涨上去
+            # （领完这一档，面板上对应的「领取」会变成「已领取」），弹窗只作辅助。
+            if got2 > got or gained:
+                n += 1
+                got = got2
+                missed = 0
+                im = after
+                log.info(f"  传奇试炼：领取首通奖励 ×{n}（面板已领取 {got} 档）")
+                continue
+            missed += 1
+            pend = pend[1:]
+            if missed >= 2:
+                log.info("  传奇试炼：首通奖励点「领取」没反应（已领取计数没涨），收手")
+                break
+        if n == 0:
+            log.info(f"  传奇试炼：首通奖励面板 — 已领取 {got} 档、未达标 {bad} 档，"
+                     f"没有可领的")
+        else:
+            log.info(f"  传奇试炼：首通奖励领完 {n} 档（另有已领取 {got} 档、未达标 {bad} 档）")
+        # 关掉浮层回主页：再点一次页签最稳（BACK 在浮层上不一定被吃）
+        self.ui.press(L.LEGEND_REWARD_TAB, 200, expect="none")
+        self.ui.wait(1.2)
+        if not self.at_page():
+            self.ui.press(L.BACK, 220, expect="none")
+            self.ui.wait(1.5)
+        if not self.at_page():
+            self.enter()
+        return n
 
 
 class TreePage(Page, FightMixin):
@@ -812,6 +1022,28 @@ class DragonPage(Page):
             log.info("  巨龙牢窟：奖励浮层点了 3 轮空白仍没关掉，收手（不乱点按钮）")
         return ok
 
+    def prog_panel_open(self, im) -> bool:
+        """「首通奖励 / 进度奖励」面板是否开着。
+
+        2026-11-18 实测面板标题区 (0,150,420,300) OCR 出 `首通奖励 灾变之翼…`；
+        关着的时候这里是巨龙页的「翡翠噩梦 / 首通奖励(按钮)」，所以必须要求
+        「首通奖励/通关奖励/进度奖励」且**同时**读到一行「未达成 / 已达成 / 领取」
+        之类的面板内容才算打开，避免把页面上的按钮文字当成面板标题。
+        """
+        if not textocr.available():
+            return False
+        try:
+            txt = textocr.read_text(im, (0, 150, 420, 300)).replace(" ", "")
+        except Exception:  # noqa: BLE001
+            return False
+        if not any(k in txt for k in ("首通奖励", "通关奖励", "进度奖励")):
+            return False
+        try:
+            body = textocr.read_text(im, (360, 250, 700, 950)).replace(" ", "")
+        except Exception:  # noqa: BLE001
+            return False
+        return any(k in body for k in ("未达成", "已达成", "领取", "已领取"))
+
     def claim_progress(self) -> int:
         """领取「进度奖励」面板里已达成的通关奖励（2026-11-03 修复 #9）。
 
@@ -821,8 +1053,21 @@ class DragonPage(Page):
         """
         if not self.at_page():
             return 0
-        self.ui.press(L.DRAGON_PROGRESS_BTN, 250)
-        self.ui.wait(1.8)
+        # 2026-11-18 第 49 轮：打完之后第二次进面板时 `press (103,377)` diff=0.000
+        # （±120px 四个补偿点也全空）→ 两条「空点」WARN。那一刻页面 classify 仍是
+        # 巨龙页，只是那颗「进度奖励」钮不在原位（打完一轮后页面状态变了）。
+        # 现在：先认面板是否已经开着，再点；点完必须 OCR 读到面板标题才算打开，
+        # 打不开就如实跳过，不做「点一下期待画面变化」的盲点。
+        for _ in range(2):
+            if self.prog_panel_open(self.shot("drg_prog_chk")):
+                break
+            self.ui.press(L.DRAGON_PROGRESS_BTN, 250, label="drg_prog_btn", expect="none")
+            self.ui.wait(1.6)
+            if self.prog_panel_open(self.shot("drg_prog_open")):
+                break
+        else:
+            log.info("  巨龙牢窟：进度奖励面板今天打不开（按钮不在原位/没有可领的），跳过")
+            return 0
         # 2026-11-10：旧版用严格金带 gold_button_bands 找「领取」，但该面板的奖励是
         # 褐色图标+钻石图案，严格档恒返回 []（今日每轮都静默 0）。真帧里达成态是
         # 图标右上角挂红「!」（(605,382) → 图标中心 (566,424)），改成角标连通块。
@@ -849,13 +1094,19 @@ class DragonPage(Page):
         ui.wait(1.5)
         im2 = self.shot("drg_buy_dlg")
         if not vision.modal_dim(im2):
-            return False, 0
+            return False, 0, None
         txt = textocr.read_text(im2, L.DRAGON_BUY_DLG_BOX).replace(" ", "")
         m = re.search(r"花费(\d+)", txt)
         cost = int(m.group(1)) if m else 0
+        # 2026-11-18：购买框原话「是否花费100（拥有1518）购买1次挑战次数？
+        # 今日可购买次数（1/2）」。那个「拥有 1518」与主城钻石（9148）不是一个数，
+        # 说明这一单扣的**不是钻石**（龙晶/其它券）。把 owned 一起返回，交给
+        # 任务层判「要不要用钻石对账」，避免再报一次假 WARN。
+        om = re.search(r"拥有(\d+)", txt)
+        owned = int(om.group(1)) if om else None
         if "购买1次挑战次数" not in txt and cost <= 0:
-            return False, 0
-        return True, cost
+            return False, 0, None
+        return True, cost, owned
 
     def close_buy_dialog(self) -> None:
         """点「取消」关掉购买框（绝不点「最大」）。"""
@@ -1016,8 +1267,36 @@ class FactionPage(Page):
                 return (600, y - 8)
         return None
 
+    def settling(self, im) -> str:
+        """本页左上是否写着「N分M秒后结算」——这段时间「开始挑战」按不动。
+
+        2026-11-19 第 66 轮实测：整轮跑到阵营挑战时，页面写「2分8秒后结算」，
+        点 (602,685) 的「开始挑战」整屏 diff=0.000、4 个补偿点也全空；
+        同一坐标在结算结束后（设备空闲复测）diff=0.824 正常进布阵页。
+        所以这不是判据坏，是游戏真的不让开打。
+        """
+        import re as _re
+        txt = textocr.read_text(im, L.FACTION_SETTLE_BOX) if textocr.available() else ""
+        m = _re.search(L.FACTION_SETTLE_RE, txt or "")
+        if not m:
+            return ""
+        return f"{m.group(1)} 分 {m.group(2)} 秒后结算"
+
     def start_run(self) -> str:
         im = self.shot("page")
+        # 2026-11-19 第 66 轮：点「开始挑战」(602,685) 整屏 diff=0.000、4 个补偿点
+        # 也全空 —— 真因是**上一层留下的提示框还压在本页上**，点击全被它吃掉。
+        # 这里先把自己压着的浮层关掉再找按钮，避免把「按钮被挡住」记成空点。
+        if vision.modal_dim(im) or vision.classify(im) in (State.DIALOG,
+                                                           State.MAIN_CITY_DIM):
+            log.info("  阵营挑战：本页上还压着提示框，先关掉再点「开始挑战」")
+            self.ui.close_popup(im)
+            self.ui.wait(1.2)
+            im = self.shot("page_after_pop")
+        settle = self.settling(im)
+        if settle:
+            self.settle_text = settle
+            return "settling"
         pos = self._start_pos(im)
         if pos is None:
             # 当前层可能在列表下方，往下翻几屏找「开始挑战」
@@ -1030,9 +1309,21 @@ class FactionPage(Page):
                     break
         if pos is None:
             return "none"
-        self.ui.press(pos, 250)
+        # 2026-11-19 第 66 轮实测：刚进阵营页的头几秒，点「开始挑战」会被游戏吞掉
+        # （整屏 diff=0.000，把「页面还在过渡」记成了空点；同样坐标等页面稳住后
+        # 点击 diff=0.824 正常进布阵页）。所以先用 expect="none"，点了没变化就
+        # 等 2s 把同一个点再按一次。
+        self.ui.wait(1.2)
+        before = im
+        self.ui.press(pos, 250, label="fac_start", expect="none")
         self.ui.wait(2.8)
         after = self.shot("after")
+        if vision.diff_ratio(before, after, (0, 0, 720, 1280)) < 0.01:
+            log.info("  阵营挑战：点「开始挑战」后画面没动（页面刚打开还在过渡），等 2s 再按一次")
+            self.ui.wait(2.0)
+            self.ui.press(pos, 250, label="fac_start_retry", expect="none")
+            self.ui.wait(2.8)
+            after = self.shot("after2")
         if vision.is_green(after, *L.FACTION_DEPLOY, r=18) or \
                 T.VI.find(after, self.CONTINUE, 0.85, roi=(460, 1155, 710, 1260)):
             return "deploy"
@@ -1220,23 +1511,54 @@ class DungeonPage(Page):
             return None
         return order[0][0]
 
+    def _clear_overlay(self) -> bool:
+        """把压在本页上的浮层关掉（2026-11-19）。
+
+        `logs/_f59.log` 08:44 三连：exp 那一类走完（打输 → 扫荡 → 「今日扫荡 N/6」
+        读不到 → 宝箱）之后，页面上还压着一层浮层（弹窗/奖励/购买确认），
+        `active_tab` 读亮度就全都一样 → 认不出选中项 → 后面 gold/grade/equip
+        三类全被跳过（3 条 WARN）。这里先按空白关一层再抓帧复核。
+        """
+        for i in range(2):
+            im = self.shot("dun_clear")
+            if not (vision.modal_dim(im) or vision.item_popup(im)):
+                return i > 0
+            # 2026-11-20 第 68 轮真因：这一层是「是否保存本次挑战？」浮层，
+            # 点空白毫无反应（帧 tests/fixtures/dungeon_save_prompt.png）。
+            if self.ui.clear_lineup_dialog(im):
+                self.ui.wait(0.8)
+                continue
+            self.ui.press(L.BLANK, 150, label="dun_clear_overlay", expect="none")
+            self.ui.wait(0.9)
+        return True
+
     def tab(self, key: str) -> bool:
         """切子副本页签，并用「选中项亮度」复核真的切过去了。
 
         2026-11-09 假成功审计：旧码 `press(..., expect="none")` 后直接 return True，
         切没切过去都不知道 → `ok_tabs` 恒 4、层数/宝箱记到错副本名下。
         """
+        self._clear_overlay()
         if not self.at_page():
             log.warn(f"  日常副本：切页签 {key} 前发现不在副本页，先回页")
             if not self.ensure_page():
                 return False
         for attempt in range(2):
+            if attempt:
+                self._clear_overlay()
             self.ui.press(self.TABS[key], 250, expect="none")
             self.ui.wait(1.6)
             cur = self.active_tab(self.ui.screen(f"dun_tab_{key}{attempt}"))
             if cur is None:
-                # 认不出版本（被压暗/浮层）就放行，保持旧行为，别把好流程拦死
-                return True
+                # 2026-11-19 假成功审计：认不出版本不能当成功。
+                # 浮层/压暗时再抓一帧；还是认不出就如实返回 False，
+                # 由调用方决定「跳过这一类」，避免层数/宝箱记到错副本名下。
+                self.ui.wait(0.8)
+                cur = self.active_tab(self.ui.screen(f"dun_tab_{key}{attempt}b"))
+                if cur is None:
+                    log.warn(f"  日常副本：页签 {key} 点完认不出当前选中哪个（可能压着浮层），"
+                             f"不当成功")
+                    return False
             if cur == key:
                 return True
             log.warn(f"  日常副本：点页签 {key} 后选中的是 {cur}（第 {attempt + 1}/2 次），"
@@ -1459,14 +1781,35 @@ class SoulPage(Page):
         if self.at_page():
             return True
         if not TrialsHub(self.ui).enter_tile("历练_罪魂之域.png", "标题_罪魂之域.png"):
-            # 卡片模板没命中时按坐标兜底（列表底部倒数第二行中间）
-            TrialsHub(self.ui).to_bottom()
-            self.ui.press((360, 530), 250)
+            # 2026-11-19：模板没命中时先 OCR 找卡片名字，再回退到旧坐标。
+            # 旧版直接 to_bottom() + 盲点 (360,530)，点偏就误开别的玩法，
+            # _soul_boss2 02:19 就是这么 FAIL 一次「进不去罪魂之域」的。
+            hub = TrialsHub(self.ui)
+            hub.to_bottom()
+            if not self._press_tile_by_text("罪魂之域"):
+                self.ui.press((360, 530), 250, label="soul_tile_fallback", expect="none")
             self.ui.wait(3.0)
         for _ in range(6):
             if self.at_page():
                 return True
             self.ui.wait(0.8)
+        return False
+
+    def _press_tile_by_text(self, name: str) -> bool:
+        """在历练列表里 OCR 找含 ``name`` 的那一行，点它。找到并点了返回 True。"""
+        try:
+            from . import textocr as _t
+            if not _t.available():
+                return False
+            im = self.ui.screen("soul_tile_ocr")
+            lines = _t.read_lines(im, L.HUB_LIST_ROI, min_score=0.45)
+        except Exception:            # noqa: BLE001
+            return False
+        for t, c, _bb, _s in lines:
+            if name in t.replace(" ", ""):
+                log.info(f"  历练列表：OCR 找到「{t}」，点 {c}")
+                self.ui.press(c, 250, label="soul_tile_ocr_hit", expect="none")
+                return True
         return False
 
     def attempts(self, im=None):
@@ -1773,6 +2116,7 @@ class RankBoardPage(Page):
                 ui.wait(1.0)
                 continue
             idle = 0
+            ny = hit[1]
             ui.press(hit, 220)
             ui.wait(1.7)
             after = self.shot("panel_claim")
@@ -1780,7 +2124,17 @@ class RankBoardPage(Page):
                 # 「获得奖励」浮层：点空白关闭（空白点本来就不改画面）
                 ui.press((360, 1060), 150, expect="none")
                 ui.wait(0.9)
+                after = self.shot("panel_closed")
+            # 2026-11-18 假成功审计：旧码点完就 n += 1，不看角标有没有消失 →
+            # 角标判错/点偏时也会报「领取 N 档」。现在必须在点后那一帧上确认
+            # 同一行的红角标确实没了，才算领到。
+            still = vision.red_badge(after, L.RANK_PANEL_ICON_X + L.RANK_PANEL_BADGE_DX,
+                                     ny + L.RANK_PANEL_BADGE_DY, r=16, need=6)
+            if still:
+                log.info(f"  排行榜：点在 ( {L.RANK_PANEL_ICON_X}, {ny} ) 后红角标还在，不算领取")
+                break
             n += 1
+            log.info(f"  排行榜：领取进度奖励 ×{n}（行 y={ny}，角标已消失）")
         return n
 
 
@@ -1950,8 +2304,18 @@ class MerchantPage(Page):
         after = self.shot("merchant_bought")
         if self.confirm_open(after):
             return "no_confirm"
-        # 购买成功时中央会出现「获得」面板；没变化则按失败处理，避免谎报
-        return "bought" if not vision.similar(im, after) else "no_confirm"
+        # 2026-11-19 审计：「画面有任何变化」= 成交太宽（飘字/动画/高亮都算）。
+        # 改成二选一硬证据：①`_already_bought` 底部变成「已购买」；
+        # ②中央出现「获得/购买成功」类面板（vision.item_popup 或中央面板局部 diff≥5%）。
+        got = self._already_bought(after)
+        if not got and vision.item_popup(after):
+            got = True
+        if not got and vision.diff_ratio(im, after, L.MERCHANT_CENTER_BOX) >= 0.05:
+            got = True
+        if not got:
+            log.info("  公会商人：确认后既没看到「获得」面板，底部也没变「已购买」，不按买到算")
+            return "no_confirm"
+        return "bought"
 
     @staticmethod
     def _already_bought(im) -> bool:
@@ -2110,14 +2474,54 @@ class ForgePage(Page):
         """
         im = self.shot("enh")
         for (bx, by), zone in zip(L.FORGE_SLOT_BTNS, L.FORGE_SLOT_ZONES):
+            before_lv = self._slot_level(im, zone)
             self.ui.press((bx, by), 220, label=f"forge_one_{bx}", expect="none")
             self.ui.wait(1.9)
             after = self.shot("enh_after")
+            after_lv = self._slot_level(after, zone)
+            # 2026-11-19 审计：只看卡片 2% 像素变化会把选中框/高亮/飘字当成强化成功。
+            # 现在优先用「槽位里读到的等级数字变大」作证据；读不到数字时才退回像素证据，
+            # 并且日志里写明「只有像素证据」。
+            if before_lv is not None and after_lv is not None:
+                if after_lv > before_lv:
+                    log.info(f"  铁匠铺：槽位 {bx} 强化成功（等级 {before_lv} → {after_lv}）")
+                    return True
+                im = after
+                continue
             if vision.diff_ratio(im, after, zone) >= 0.02:
-                return True
+                # 2026-11-20 审计 M6：只凭「卡片 2% 像素变化」会把选中框/高亮/飘字当强化成功。
+                # 等级读不到时再要一条独立证据 —— 强化要扣金币，金币条文字必须变。
+                from . import textocr as _ocr
+
+                c0 = c1 = ""
+                if _ocr.available():
+                    try:
+                        c0 = _ocr.read_text(im, L.FORGE_COST_BOX).replace(" ", "")
+                        c1 = _ocr.read_text(after, L.FORGE_COST_BOX).replace(" ", "")
+                    except Exception:      # noqa: BLE001
+                        c0 = c1 = ""
+                if c0 and c1 and c0 != c1:
+                    log.info(f"  铁匠铺：槽位 {bx} 强化成功（等级读不到；像素变化 + 金币「{c0}」→「{c1}」双证）")
+                    return True
+                log.info(f"  铁匠铺：槽位 {bx} 卡片像素变了，但等级和金币文字都没变 → 当高亮，不算强化")
+                im = after
+                continue
             im = after
         log.info("  铁匠铺：四件装备点「强化1次」后卡片都没变化（金币/材料不足），不算强化")
         return False
+
+    @staticmethod
+    def _slot_level(im, zone):
+        """读槽位卡片里的「N级」数字；读不到返回 None。"""
+        from . import textocr
+        if not textocr.available():
+            return None
+        try:
+            txt = textocr.read_text(im, zone).replace(" ", "")
+        except Exception:      # noqa: BLE001
+            return None
+        m = re.search(r"(\d{2,5})\s*级", txt)
+        return int(m.group(1)) if m else None
 
     def enhance_50(self) -> bool:
         """「强化50级」：金币够才点；点完复核金币条/等级真的变了。
@@ -2389,6 +2793,18 @@ class GuildPage(Page):
             if vision.is_gold(im, *L.GUILD_TRIAL_OK, r=16):
                 self.ui.press(L.GUILD_TRIAL_OK, 220, label="gtrial_ok", expect="none")
                 self.ui.wait(2.0)
+                # 2026-11-20 审计 MAJOR：点了「确定」就 return True 不复核，结算页没关
+                # 也会被当「一轮打完」。现在要求画面真的离开结算类状态。
+                chk = vision.classify(self.shot("gtrial_ok_chk"))
+                # 2026-11-20 08:13 实机：这里写过 State.RESULT_MAIN / RESULT_TRIAL /
+                # RESULT_GUILD 三个**不存在的枚举**，点击时抛 AttributeError，
+                # guild_trial 直接记 FAIL（幸好 scheduler 自愈重试救回）。
+                # State 里实际只有 RESULT_TOWER/TREE/LEGEND/GENERIC/DEFEAT 五种结算态。
+                if chk in (State.RESULT_TOWER, State.RESULT_TREE, State.RESULT_LEGEND,
+                           State.RESULT_GENERIC, State.RESULT_DEFEAT):
+                    log.info("  公会试炼：点了「确定」还停在结算页，继续等（不算这一轮）")
+                    self.ui.wait(1.5)
+                    continue
                 return True
             fighting = vision.classify(im) == State.BATTLE
             self.ui.wait(2.0 if fighting else 4.0)
@@ -2447,8 +2863,16 @@ class BountyPage(Page):
         2026-10-30 实测：固定点 (632,445) 有时会点到关卡直接进战斗，
         所以按完先确认是不是悬赏页；不是就退出来，避免在战役里瞎打。
         """
-        for attempt in range(2):
+        for attempt in range(3):
+            if not MainCity(self.ui).ensure():
+                return False
             MainCity(self.ui).tab(L.TAB_CAMPAIGN)
+            # 2026-11-18 第 48 轮实测：刚切到战役页地图还没画完就找模板，
+            # 点 (654,495) 落到一个 classify=unknown 的页面（既不是悬赏页、
+            # 也不是布阵/战斗），旧码只对 DEPLOY/BATTLE 做回退 → 停在错页上，
+            # 第二次再点还是错页，最后报「悬赏入口打不开」而任务里那步白丢。
+            # 现在：等地图画完再找，且只要不是悬赏页就一律先退回来。
+            self.ui.wait(1.2)
             im = self.shot("camp_map")
             m = T.VI.find(im, "悬赏入口.png", 0.80)
             self.ui.press(m.center if m else L.BOUNTY_ENTRY, 250)
@@ -2466,6 +2890,15 @@ class BountyPage(Page):
                     self.ui.wait(1.4)
                 self.ui.press(L.BACK, 250, expect="none")
                 self.ui.wait(1.4)
+            else:
+                # 落到未识别页/别的面板：也要退回来，不能在错页上继续点
+                self.ui.press(L.BACK, 250, expect="none")
+                self.ui.wait(1.2)
+                if vision.classify(self.ui.screen("bounty_back")) not in (
+                        State.MAIN_CITY, State.NAV_PAGE):
+                    self.ui.press(L.BACK, 200, expect="none")
+                    self.ui.wait(1.0)
+                MainCity(self.ui).ensure()
         log.warn("  悬赏入口打不开")
         return False
 
@@ -2517,19 +2950,47 @@ class BountyPage(Page):
         ③顶部积分真的减少（减少值即本单花费）。缺一条都返回 False，绝不虚记。
         """
         tag = f"bounty_{label or y}"
+        # 2026-11-15：上一行留下的「是否消耗 ?N 加速…」确认框如果还在，先点掉再动，
+        # 否则这一下 (565,y) 会直接砸在框里的金色「加速」上（f42 就是这样花了 10 钻）。
+        if self.ui.dismiss_diamond_prompt():
+            return False, 0, "页面上还压着「消耗钻石加速」确认框，已点取消，本行先不接"
         before = self.shot(f"{tag}_before")
+        # 2026-11-18：上一单的「任务详情」面板如果还盖在列表上，这一格 (565,y)
+        # 底下就是金色「加速完成」——按下去必弹钻石确认框（f44 就是这么触发的）。
+        # 所以先认详情面板，还开着就关掉、这一行不接。
+        if self.detail_open(before):
+            self.ui.press(L.BLANK, 150, expect="none")
+            return False, 0, "上一单的「任务详情」还开着，先关掉再点"
         pts0 = self.points(before)
         self.ui.press((L.BOUNTY_ACCEPT_X, y), 250, label=f"{tag}_accept", expect="none")
         im = None
         for i in range(3):
             self.ui.wait(1.2)
             im = self.shot(f"{tag}_detail{i}")
+            if self.ui.dismiss_diamond_prompt(im):
+                # 详情面板里的「加速完成」被误触 → 游戏弹了钻石确认框，已点取消。
+                return False, 0, "点「接受」误触了「加速完成」，游戏弹钻石确认框（已点取消）"
             if self.detail_open(im):
                 break
             if i == 0:
+                # 2026-11-15：第一次「接受」其实已经打开了某个面板/弹窗（只是不是我们要的
+                # 「任务详情」）时，**不能**在同一坐标再点一下——详情面板里 (565,616) 附近
+                # 就是「加速完成」，一点就弹钻石确认框（f42 就是这么花的 10 钻）。
+                # 压暗背景 = 有模态层在上面，这时只关不点。
+                if vision.modal_dim(im) or vision.diff_ratio(
+                        before, im, (0, 0, im.width, im.height)) >= 0.01:
+                    # 2026-11-20 08:02 实机：这一帧没有压暗（modal_dim=False），但画面确实
+                    # 变了 —— 是新开的「任务详情/别的面板」，此时在同一坐标补点会砸到面板
+                    # 里的「加速完成」（游戏随即弹钻石确认框，靠新增闸门才点掉取消）。
+                    # 所以只要「画面变了」就不再同点重试，宁可这一行不接。
+                    log.info("  悬赏：点「接受」后画面已经变了（多半开了面板），不在同一坐标"
+                             "补点（防止砸到「加速完成」）")
+                    break
                 self.ui.press((L.BOUNTY_ACCEPT_X, y), 250, label=f"{tag}_accept2",
                               expect="none")
         if im is None or not self.detail_open(im):
+            if self.ui.dismiss_diamond_prompt():
+                return False, 0, "点「接受」后弹出钻石确认框（已点取消），未进入详情"
             self.ui.press(L.BLANK, 150, expect="none")
             return False, 0, "点「接受」后没弹出「任务详情」面板（可能已接/不可接）"
         pair = self.detail_cost(im)
@@ -2540,6 +3001,8 @@ class BountyPage(Page):
         self.ui.press(L.BOUNTY_SEND, 220, label=f"{tag}_send", expect="none")
         self.ui.wait(2.4)
         after = self.shot(f"{tag}_after")
+        if self.ui.dismiss_diamond_prompt(after):
+            return False, 0, "点了「派遣」后弹出钻石确认框（已点取消），这一单不认"
         if self.detail_open(after):
             self.ui.press(L.BLANK, 150, expect="none")
             return False, 0, "点了「派遣」后面板还在（没接上）"
@@ -2565,6 +3028,36 @@ class BountyPage(Page):
 class RankPage(Page):
     name = "rank"
 
+    def at_page(self, im=None) -> bool:
+        """军衔页锚点：认「军衔/官阶/晋升/累计登录/通关奖励」任一。
+
+        2026-11-18 实测：主城左下入口 (170,1070) 是活动条，下架后点了没反应，
+        旧码在**主城**上按 is_gold(360,875) 找「晋升」命中主城金色装饰 → 白点。
+        所以任何点击前都要先过这一关；OCR 不可用时退化为「不是主城」。
+        """
+        if im is None:
+            im = self.shot("rank_at")
+        if textocr.available():
+            try:
+                txt = textocr.read_text(im, L.RANK_MILITARY_BOX) or ""
+            except Exception as e:
+                log.warn(f"  军衔：读页面文字失败（{e}），按「不是主城」判")
+                return vision.classify(im) not in (State.MAIN_CITY, State.UNKNOWN)
+            if not txt:
+                # 2026-11-19 审计：OCR 可用却读空 —— 真官阶页一定有「军衔/官阶/…」
+                # 文案，读空多半是页面正在加载。等一帧复核，仍空就判「不是官阶页」，
+                # 不再退化成「任何非主城页都算」（那会让 claim_rows 在别页白扫 30 屏）。
+                self.ui.wait(1.2)
+                im2 = self.shot("rank_at2")
+                try:
+                    txt = textocr.read_text(im2, L.RANK_MILITARY_BOX) or ""
+                except Exception:      # noqa: BLE001
+                    txt = ""
+                if not txt:
+                    return False
+            return any(k in txt for k in L.RANK_MILITARY_KEYS)
+        return vision.classify(im) not in (State.MAIN_CITY, State.UNKNOWN)
+
     def claim_rows(self) -> int:
         """官阶奖励：领取后该行会被移到列表末尾、整列上浮，固定 y 一定会漏领。
 
@@ -2573,13 +3066,20 @@ class RankPage(Page):
         所以改成动态识别：在右侧按钮列里找金色按钮 → 点一个 → 关浮层 → 再找；
         当前屏没有了就往下滚，连续两屏都没有才结束。
         """
+        if not self.at_page():
+            log.info("  军衔：当前不在军衔页（入口下架/跑偏），不扫奖励行")
+            return 0
         # 2026-11-09：进页时的滚动位置会沿用上一次（promote() 先 scroll_up 过），
         # 而旧码「连续 1 屏没金钮就收手」——奖励行在下面一两屏时就整片漏领。
         # 实测：军衔页「累计登录28天 28/28」的「领取」在 y=752，一次 scroll_up 后就
         # 落到扫描区外，任务报「领奖 0 行」。改成先归位到顶部，再容忍 4 屏空。
+        # 2026-11-18 用户要求「官阶奖励进页不要下滑」：旧码这里调的是 dev.scroll_up
+        # （手指上划 = 内容往上滚 = 看下面的条目），进页就把顶部几行奖励滑走了，
+        # 正是「下滑」。改成 scroll_down 归位到顶部（看上面的条目），页本来就
+        # 在顶部时无副作用。
         for _ in range(2):
-            self.ui.dev.scroll_up(360, 1000, 400, 500)
-            self.ui.wait(0.8)
+            self.ui.dev.scroll_down(360, 350, 1000, 450)
+            self.ui.wait(0.6)
         n = 0
         idle = 0
         screens = 0
@@ -2617,7 +3117,11 @@ class RankPage(Page):
           ② 点完要复核（画面确实变了 / 出现了确认钮）才算晋升成功，否则 return False
              —— 旧码无论如何都 `return True`，`promoted += 1` 无条件累加。
         """
-        self.ui.dev.scroll_up(360, 1000, 400, 500)
+        if not self.at_page():
+            log.info("  军衔：当前不在军衔页，不点「晋升」")
+            return False
+        # 同上：晋升钮在页面上部，先归位顶部（scroll_down），不要下滑。
+        self.ui.dev.scroll_down(360, 350, 1000, 450)
         self.ui.wait(1.2)
         im = self.shot("promo")
         pos = L.RANK_PROMOTE

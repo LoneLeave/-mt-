@@ -15,7 +15,7 @@
     "state_file": "logs/state.json",
     "tap_ms": 220,
     "keep_screenshots": 300,
-    "max_task_minutes": 40
+    "max_task_minutes": 20
   },
   "limits": {
     "diamond_budget": 800,
@@ -27,7 +27,8 @@
       "priority": 10,
       "params": {
         "max_wins": 100,
-        "max_lose": 3
+        "max_lose": 3,
+        "timeout_minutes": 25
       }
     },
     "legend": {
@@ -163,11 +164,6 @@
       "priority": 1,
       "params": {}
     },
-    "rank": {
-      "enabled": true,
-      "priority": 2,
-      "params": {}
-    },
     "friend": {
       "enabled": true,
       "priority": 3,
@@ -299,6 +295,25 @@
       "params": {
         "times": 1
       }
+    },
+    "weapon": {
+      "enabled": true,
+      "priority": 12,
+      "params": {
+        "max_try": 3
+      }
+    },
+    "tianshen": {
+      "enabled": true,
+      "priority": 26,
+      "params": {
+        "max_swap": 6
+      }
+    },
+    "qianchou": {
+      "enabled": true,
+      "priority": 28,
+      "params": {}
     }
   }
 }

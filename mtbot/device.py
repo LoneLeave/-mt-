@@ -62,6 +62,73 @@ class Device:
             time.sleep(4)
         return False
 
+    # ---------- 整机恢复 ----------
+    # 2026-11-20：第 64 轮（11-19 13:42）模拟器整机挂了 —— `adb devices` 为空、
+    # `MuMuManager info -v 0` 报 `is_process_started: false`，之后每个任务都在
+    # `screencap` 上抛 DeviceError，整轮 29/45 就中止，剩下十几个任务全 FAIL。
+    # 这里给设备加一条「自己把模拟器拉回来」的通道：先重连 ADB（多数情况只是
+    # 掉线），不行再让 MuMuManager 重新启动实例，最多等 timeout 秒。
+    MUMU_CANDIDATES = (
+        r"D:/Program Files/Netease/MuMu Player 12/nx_main/MuMuManager.exe",
+        r"D:/Program Files/Netease/MuMu Player 12/shell/MuMuManager.exe",
+    )
+
+    def mumu_manager(self) -> str:
+        cands = []
+        try:
+            cands.append(self.cfg.emulator.manager)
+        except AttributeError:
+            pass
+        for p in list(cands) + list(self.MUMU_CANDIDATES):
+            if p and Path(p).exists():
+                return str(p)
+        return ""
+
+    def alive(self) -> bool:
+        """设备是否真的能执行 shell（offline / 空 devices 都算死）。"""
+        try:
+            return self.shell("getprop sys.boot_completed", timeout=8).strip() == "1"
+        except DeviceError:
+            return False
+
+    def recover(self, timeout: float = 180.0) -> bool:
+        """尝试把设备救回来。返回 True 表示 shell 已经可用。"""
+        if self.alive():
+            return True
+        log.warn("  设备没有响应，尝试自动恢复（重连 ADB）")
+        try:
+            self.adb("connect", self.serial, timeout=10)
+        except DeviceError:
+            pass
+        if self.alive():
+            log.warn("  设备已恢复（ADB 重连成功）")
+            self.launch()
+            return True
+        mumu = self.mumu_manager()
+        if mumu:
+            log.warn(f"  仍然没有响应，尝试重新启动模拟器（{Path(mumu).parent.name}）")
+            try:
+                subprocess.run([mumu, "control", "-v", "0", "launch"],
+                               capture_output=True, timeout=90)
+            except (OSError, subprocess.SubprocessError) as e:   # noqa: BLE001
+                log.warn(f"  启动模拟器失败：{e}")
+        else:
+            log.warn("  找不到 MuMuManager.exe，只能等 ADB 自己回来")
+        deadline = time.time() + max(30.0, timeout)
+        while time.time() < deadline:
+            time.sleep(6)
+            try:
+                self.adb("connect", self.serial, timeout=8)
+            except DeviceError:
+                pass
+            if self.alive():
+                log.warn(f"  设备已恢复（等了 {int(timeout - (deadline - time.time()))}s），重新拉起游戏")
+                self.launch()
+                time.sleep(8)
+                return True
+        log.warn("  自动恢复失败：设备依然没有响应")
+        return False
+
     # ---------- 输入 ----------
     # 2026-11-11：模拟器前台切换的瞬间会拒绝注入触摸事件
     # （`SecurityException: Injecting to another application requires INJECT_EVENTS permission`），
@@ -116,7 +183,8 @@ class Device:
         self.key("4")
 
     # ---------- 截图 ----------
-    def screenshot(self, name: str = "shot", fresh: bool = True, tries: int = 4) -> Image.Image:
+    def screenshot(self, name: str = "shot", fresh: bool = True, tries: int = 4,
+                   _recovered: bool = False) -> Image.Image:
         """抓一帧。
 
         2026-11-07 加固：screencap / pull 偶发「文件没写出来」或「png 截断」，
@@ -130,6 +198,7 @@ class Device:
         if not fresh and self._cache and now - self._cache[0] < self._cache_ttl:
             return self._cache[1]
         err = ""
+        recovered = _recovered
         for attempt in range(1, max(1, tries) + 1):
             self._shot_n += 1
             remote = f"/sdcard/_mt_{self._shot_n}.png"
@@ -160,6 +229,10 @@ class Device:
             log.warn("  截图连续失败，临时复用 %.1fs 前的画面继续（可能略旧）"
                      % (time.time() - self._cache[0]))
             return self._cache[1]
+        # 2026-11-20：以前这里直接抛错 → 整轮中止。现在先救一次设备再重抓。
+        if not recovered and self.recover():
+            log.warn("  设备恢复后重新抓帧")
+            return self.screenshot(name, fresh=True, tries=tries, _recovered=True)
         raise DeviceError(f"截图连续 {tries} 次失败：{err}")
 
     def _trim(self) -> None:

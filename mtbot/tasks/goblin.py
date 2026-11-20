@@ -232,9 +232,9 @@ class GoblinTask(BaseTask):
         """
         tpls = self._layer_tpls()
         t0 = time.time()
-        budget = 24.0
+        budget = 40.0
         pages = 0
-        for attempt in range(4):
+        for attempt in range(6):
             if time.time() - t0 > budget:
                 log.info(f"  切第 {n} 层超时（{budget:.0f}s），先不切了")
                 break
@@ -246,26 +246,22 @@ class GoblinTask(BaseTask):
             if not hit:
                 # 目标不在这六行里：只在「目标号更大」时上滑翻页；
                 # 反方向的下滑在列表到顶时会变成「点第二层」，会把层切走并关掉列表。
-                if rows and n > max(r[0] for r in rows) and pages < 6:
+                if rows and n > max(r[0] for r in rows) and pages < 10:
                     pages += 1
                     before = [r[0] for r in rows]
-                    ui.dev.swipe(150, 1060, 150, 850, 450)
-                    ui.wait(0.9)
-                    after = [r[0] for r in self._layer_rows(ui, "gob_layer_pg")]
-                    if not after or after == before:
-                        log.info(f"  层列表翻不动了（可见 {before}），没有第 {n} 层")
+                    after = self._scroll(ui, up=True, before=before, tag="gob_layer_pg")
+                    if not after:
+                        log.info(f"  层列表翻不动了（可见 {before}，滑了两次都没变），没有第 {n} 层")
                         break
                     continue
                 # 目标比当前可见的还小：列表没在顶部时，向下拖才等于往回翻
                 # （已在顶部时向下拖 = 点第二层，所以必须先判 min > 1）。
-                if rows and n < min(r[0] for r in rows) and min(r[0] for r in rows) > 1 and pages < 6:
+                if rows and n < min(r[0] for r in rows) and min(r[0] for r in rows) > 1 and pages < 10:
                     pages += 1
                     before = [r[0] for r in rows]
-                    ui.dev.swipe(150, 850, 150, 1060, 450)
-                    ui.wait(0.9)
-                    after = [r[0] for r in self._layer_rows(ui, "gob_layer_bk")]
-                    if not after or after == before:
-                        log.info(f"  层列表翻不动了（可见 {before}），没有第 {n} 层")
+                    after = self._scroll(ui, up=False, before=before, tag="gob_layer_bk")
+                    if not after:
+                        log.info(f"  层列表翻不动了（可见 {before}，滑了两次都没变），没有第 {n} 层")
                         break
                     continue
                 log.info(f"  层列表里没有第 {n} 层（可见 {[r[0] for r in rows]}）")
@@ -281,6 +277,31 @@ class GoblinTask(BaseTask):
         self._close_layer_list(ui)
         log.warn(f"  列表里没切换到第 {n} 层")
         return False
+
+    def _scroll(self, ui, up: bool, before: list, tag: str) -> list:
+        """翻页一次并重新读行；返回「变了的新行」，两次都没变返回 []。
+
+        2026-11-20 第 76 轮实测（`logs/_f76.log` 10:47:44 / 10:49:03）：
+        层列表停在 [6..11] 时切第 1 层，只滑一次读到「翻不动了」就收手，
+        但同一手势在设备空闲时探针里是有效的（[8..12] → [4..8]）——
+        真正原因是**滑动被界面吞掉**（页面刚刷完的 1~2 秒不吃输入，和点击被吞同源）。
+        所以这里滑两次：第一次没变化就等久一点再滑一次，仍没变化才算翻不动。
+        """
+        for i in range(2):
+            if up:
+                ui.dev.swipe(150, 1060, 150, 850, 450)
+                ui.wait(1.0 if i == 0 else 1.8)
+            else:
+                ui.dev.swipe(150, 850, 150, 1060, 450)
+                ui.wait(1.0 if i == 0 else 1.8)
+            if not self._layer_list_open(ui, f"{tag}_op{i}"):
+                self._open_layer_list(ui)
+            rows = self._layer_rows(ui, f"{tag}_{i}")
+            if rows and rows != before:
+                return rows
+            if i == 0:
+                log.info(f"  层列表滑动第一次没反应（可见 {before}），同一手势再来一次（可能被界面吞了）")
+        return []
 
     def _layer_rows(self, ui, tag="gob_layer_rows") -> list:
         """读已展开的层列表 → [(层号, x, y)]（实测一屏 6 行、文字置信度 1.0）。"""
@@ -387,10 +408,12 @@ class GoblinTask(BaseTask):
         t0 = time.time()
         while time.time() - t0 < 300:
             im = ui.screen("gob_battle")
-            if self._find(im, "胜利.png", 0.85) or self._find(im, "结算界面.png", 0.85):
-                return "win"
+            # 2026-11-19：先把「失败」判掉 —— 「结算界面.png」在输的结算页上同样命中，
+            # 旧顺序（胜利/结算 先于 失败）会把打输的场次记成 win。
             if self._find(im, "失败.png", 0.85):
                 return "lose"
+            if self._find(im, "胜利.png", 0.85) or self._find(im, "结算界面.png", 0.85):
+                return "win"
             if not pressed_auto:
                 m = self._find(im, "一键上阵.png", 0.85, roi=(180, 1155, 420, 1260))
                 if m:

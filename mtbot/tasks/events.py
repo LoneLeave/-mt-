@@ -73,7 +73,14 @@ class DragonTask(BaseTask):
             ui.wait(2.8)
         else:
             m = T.VI.find(im, "战斗按钮.png", 0.85, roi=(460, 1155, 710, 1260))
-            ui.press(m.center if m else L.FIGHT, 200, label="fight", expect="none")
+            # 2026-11-20 审计 C5：模板没命中时旧码直接按固定坐标 L.FIGHT —— 没有
+            # 任何「这里确实有按钮」的证据。现在退回金带质心（质心本身必须是金色），
+            # 两条都拿不到就收手，不猜。
+            pt = m.center if m else vision.gold_band_point(im, (460, 1155, 710, 1260))
+            if pt is None:
+                log.info("  巨龙牢窟：找不到「战斗」按钮（模板与金带都没有），这一场不打")
+                return "back"
+            ui.press(pt, 200, label="fight", expect="none")
             ui.wait(6)
         page = DragonPage(ui)
         t0 = time.time()
@@ -105,14 +112,14 @@ class DragonTask(BaseTask):
             ui.wait(1.5)
         return "timeout"
 
-    def _buy_attempt(self, ui, page, ctx) -> int:
+    def _buy_attempt(self, ui, page, ctx, d_city: "int | None" = None) -> int:
         """次数为 0 时点「挑战」→ 读购买框 → 白名单放行 → 买 1 次并复核次数增加。
 
         2026-11-11：用户要求「巨龙洞窟的购买次数与购买后继续挑战」；实测购买框是
         预制款「是否花费 100（拥有 1518) 购买1次挑战次数？今日可购买次数（1/2）」。
         三重自证：弹窗金额 + 挑战次数增加 + （收尾）主城钻石差额。
         """
-        opened, cost = page.buy_attempt(ui)
+        opened, cost, owned = page.buy_attempt(ui)
         if not opened:
             log.info("  巨龙牢窟：点「挑战」没弹出购买框（今天也许不能买），不买次数")
             return 0
@@ -120,18 +127,37 @@ class DragonTask(BaseTask):
             log.info("  巨龙牢窟：购买框里读不到「花费 N」，不买次数")
             page.close_buy_dialog()
             return 0
-        if not self.may_spend(ctx, "巨龙牢窟·挑战次数", cost, kind="attempt"):
+        # 2026-11-18：先确认这个购买框扣的是不是钻石——框里写「拥有 N」，
+        # 而主城钻石是另一个数时就说明它花的是别的货币（f43 实测 拥有 1518 /
+        # 钻 9148，两次购买钻石 0 差）。那种情况不再走钻石预算与钻石对账。
+        # 2026-11-19 修 bug：这里原来写 self.diamonds(ui) —— diamonds 是 staticmethod，
+        # 要吃的是**截图**不是 UI，于是恒返回 None、判据永远失效，日志里还每买一次
+        # 冒两条「textocr：识别失败（'UI' object has no attribute 'width'）」。
+        # 主城钻石在进巨龙页之前就由 run() 读好了（d_city），直接用它。
+        d_now = d_city
+        is_diamond = True
+        if owned is not None and d_now is not None and abs(owned - d_now) > 20:
+            is_diamond = False
+            log.info(f"  巨龙牢窟：购买框写「拥有 {owned}」，主城钻石是 {d_now}"
+                     f"——这一单扣的不是钻石，按非钻货币记账")
+        if is_diamond and not self.may_spend(ctx, "巨龙牢窟·挑战次数", cost, kind="attempt"):
             page.close_buy_dialog()
             return 0
         before = page.attempts()
         ui.press(L.DRAGON_BUY_OK, 220, label="drg_buy_ok", expect="none")
         ui.wait(1.7)
         after = page.attempts()
-        if before is not None and after is not None and after <= before:
+        # 2026-11-20 审计 C3：旧码 before/after 有一边是 None 时会直接落到下面的
+        # 「买到 1 次」并把 cost 返回给调用方累进 bought —— 付费无自证记成功。
+        if after is None:
+            log.info("  巨龙牢窟：点「购买」后读不到挑战次数（缺证），不认这次购买")
+            return 0
+        if before is not None and after <= before:
             log.info(f"  巨龙牢窟：点了「购买」但挑战次数没增加（{before}→{after}），不认这次购买")
             return 0
         log.info(f"  巨龙牢窟：买到 1 次挑战次数（弹窗写花费 {cost}，挑战次数 {before}→{after}）")
-        return int(cost)
+        # 返回值：正数 = 花钻石；负数 = 非钻石货币（取绝对值记账，收尾不对钻石账）
+        return int(cost) if is_diamond else -int(cost)
 
     def run(self, ctx: TaskContext) -> TaskResult:
         ui, p = ctx.ui, self.p
@@ -150,6 +176,8 @@ class DragonTask(BaseTask):
         fights = 0
         bought = 0
         spent_popup = 0
+        other_popup = 0          # 非钻石货币花掉的部分（购买框「拥有 N」≠ 主城钻石）
+        other_bought = 0
         buys = max(0, int(p.get("buy_attempts", 2)))
         reason = ""
         deadline = time.time() + 60 * ctx.cfg.runtime.max_task_minutes
@@ -161,10 +189,14 @@ class DragonTask(BaseTask):
             att = page.attempts()
             if att == 0:
                 if bought < buys:
-                    spent = self._buy_attempt(ui, page, ctx)
+                    spent = self._buy_attempt(ui, page, ctx, d0)
                     if spent:
                         bought += 1
-                        spent_popup += spent
+                        if spent > 0:
+                            spent_popup += spent
+                        else:
+                            other_popup += -spent
+                            other_bought += 1
                         continue
                 reason = "今日挑战次数已用尽"
                 log.info("  巨龙牢窟今日挑战次数已用尽（底部「挑战次数：0」），收手")
@@ -205,7 +237,9 @@ class DragonTask(BaseTask):
         ui.wait(1.0)
         MainCity(ui).ensure()
         spent_txt = ""
-        if bought:
+        if other_bought:
+            spent_txt += f"，买次数 {bought} 次（其中 {other_bought} 次不是钻石，弹窗合计 {other_popup}）"
+        if bought - other_bought:
             if d0 is None:
                 ui.wait(0.8)
                 d0 = self.diamonds_stable(ui, "drg_d0b")
@@ -213,7 +247,15 @@ class DragonTask(BaseTask):
             if d0 is not None and d1 is not None:
                 spent = d0 - d1
                 spent_txt = f"，买次数花钻 {spent}（主城 {d0}→{d1}）"
-                if spent != spent_popup:
+                if spent == 0 and bought > 0:
+                    # 2026-11-20 第 67 轮：买了 2 次（弹窗合计 200）但主城钻石 2472→2472
+                    # 一分没少 —— 和 11-18 那次一样，这一单扣的不是钻石（龙晶/券）。
+                    # 既然「钻石没变」就是新证据，不该再报 WARN 让人去核对。
+                    spent_txt = (f"，买次数 {bought} 次（弹窗合计 {spent_popup}，"
+                                 f"主城钻石 {d0}→{d1} 没变，说明扣的不是钻石）")
+                    log.info(f"  巨龙牢窟：买了 {bought} 次，主城钻石 {d0}→{d1} 没变，"
+                             f"说明这一单扣的不是钻石（按非钻记账）")
+                elif spent != spent_popup:
                     log.warn(f"  巨龙牢窟：买了 {bought} 次（弹窗合计 {spent_popup}），主城钻石 {d0}→{d1}（差 {spent}），与预期对不上，请核对")
             else:
                 # 2026-11-15：主城钻石读数会因为 HUD 还没画出来而失败；改成用购买弹窗金额
@@ -245,10 +287,12 @@ class FactionTask(BaseTask):
 
         deadline = time.time() + 60 * ctx.cfg.runtime.max_task_minutes
         runs = 0
+        partial = False
         resumed = False
         aborted = False
         retried = False
         reason = ""
+        settling = ""
         if page.at_page():
             # 底部三个阵营只有「开启中」的那个能打，先把它点选上
             page.ensure_active_faction()
@@ -276,6 +320,12 @@ class FactionTask(BaseTask):
                 ui.wait(1.8)
                 page.ensure_active_faction()
                 r = page.start_run()
+            if r == "settling":
+                log.info(f"  阵营挑战：本页还在结算中（{getattr(page, 'settle_text', '')}），"
+                         f"这段时间「开始挑战」按不动，等下一轮再打")
+                settling = getattr(page, "settle_text", "")
+                reason = f"本轮还在结算（{settling}），等下一轮再打"
+                break
             if r == "none":
                 reason = "没有可挑战的层（或今日已打完）"
                 log.info(f"  阵营挑战{reason}，收手")
@@ -284,13 +334,17 @@ class FactionTask(BaseTask):
                 reason = page.popup_text or "点「开始挑战」只弹了提示框"
                 log.info(f"  阵营挑战：开始挑战只弹提示框（{reason}），收手")
                 break
-            runs += 1
-            log.info(f"  阵营挑战第 {runs} 轮开始（一层 30 波，无跳过键，切 ×4 倍速）")
+            # 2026-11-19 审计：旧码在这里就 `runs += 1`，跑一半被切走/超时也算一轮，
+            # 结论串「阵营挑战 N 轮」会多报。这里只拿 runs+1 做日志编号，
+            # 真的跑完（out == "done"）才计数。
+            log.info(f"  阵营挑战第 {runs + 1} 轮开始（一层 30 波，无跳过键，切 ×4 倍速）")
             out = page.run_battle(max(60, deadline - time.time()))
-            log.info(f"  阵营挑战第 {runs} 轮结束：{out}")
+            log.info(f"  阵营挑战第 {runs + 1} 轮结束：{out}")
             if out != "done":
                 aborted = True
+                partial = True
                 break
+            runs += 1
 
         rewards = 0
         if page.at_page():
@@ -303,8 +357,12 @@ class FactionTask(BaseTask):
         ui.wait(1.0)
         MainCity(ui).ensure()
         msg = f"阵营挑战 {runs} 轮"
+        if partial:
+            msg += "（另有一轮没跑完就收手，不计）"
         if reason:
             msg += f"（{reason}）"
+        if settling and not reason:
+            msg += f"（本轮还在结算：{settling}）"
         if resumed:
             msg += "（含进页续上的战斗）"
         if aborted:

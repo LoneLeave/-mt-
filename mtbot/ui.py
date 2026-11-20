@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from collections import deque
@@ -33,6 +34,8 @@ class UI:
         # 2026-11-03：调度器每个任务前设置绝对时间戳，任务里任何 press/screen/wait
         # 一旦超时都会抛 TaskTimeout，由调度器兜底，避免死循环把整轮拖死。
         self.deadline: float | None = None
+        # 2026-11-19 看门狗：卡死时写一句人话，_check_deadline 抛异常时带出去
+        self.stall_note: str = ""
         # 调度器用它判断「任务 0 次动作却自报 OK」——2026-11-03 用户要求收紧语义。
         self.actions = 0
         # 2026-11-09：只在「变化校验真的命中」时 +1，用来区分「点到了」和「点空了」。
@@ -72,7 +75,9 @@ class UI:
     def _check_deadline(self) -> None:
         if self.deadline is not None and time.time() > self.deadline:
             self.deadline = None
-            raise TaskTimeout("任务超过 max_task_minutes，已强制中止")
+            note = getattr(self, "stall_note", "")
+            self.stall_note = ""
+            raise TaskTimeout(note or "任务超过 max_task_minutes，已强制中止")
 
     def _check_guard(self) -> None:
         """阴阳师到前台了没？到了就抛 OasYield，让调度器立刻收摊。"""
@@ -319,13 +324,35 @@ class UI:
         self._save_click_issue(key, before, after, (x, y), diff)
         streak = self._miss_streak.get(key, 0) + 1
         self._miss_streak[key] = streak
-        log.warn(f"  空点：{key} 在 ({x},{y}) 点击后 ±120px 无变化（diff={diff:.3f}，连续 {streak} 次）")
+        # 2026-11-20：这一次 MISS 先不当问题报——真机最常见的成因是「页面刚切换的
+        # 1~2 秒 UI 吞点击」，下面会先用同一坐标重试；只有重试也没反应才升级成 WARN。
+        log.info(f"  空点：{key} 在 ({x},{y}) 点击后 ±120px 无变化"
+                 f"（diff={diff:.3f}，连续 {streak} 次），先原样重试一次")
         if streak >= 3:
             # 连续 3 次 MISS：判为死点，登记后立即放弃，不再做 4 个补偿点
             self._dead[key] = streak
             self._persist_dead()
             log.warn(f"  死点登记：{key} 连续 {streak} 次 MISS，跳过补偿并停止后续点击")
             return False
+        # 2026-11-20：同一坐标先原样重试一次，再谈「偏移」。
+        # 真机很常见「页面刚切换的 1~2 秒内 UI 不吃输入」：点击被吞（diff≈0），
+        # 但这不是坐标错——旧逻辑直接跳去「偏移补偿」，会把这种吞点击误记进
+        # 学习表（rank_board 就是 (628,884) 被吞、补偿记成 (628,876) 命中）。
+        if self.click_retry > 0:
+            time.sleep(max(1.6, self.click_wait))
+            self.dev.press(x, y, ms)
+            time.sleep(self.click_wait)
+            after = self.screen("click")
+            diff = self._region_diff(before, after, (x, y))
+            hit = diff >= self.click_thresh
+            self._log_click(key, (x0, y0), (x, y), ms, hit, diff, -1)
+            if hit:
+                self.hits += 1
+                self._miss_streak.pop(key, None)
+                log.info(f"  空点重试：{key} 同一坐标 ({x},{y}) 再点一次命中"
+                         f"（diff={diff:.3f}，上一次是被界面吞掉的）")
+                return True
+        log.warn(f"  空点：{key} 同一坐标重试仍无变化（diff={diff:.3f}），改试偏移补偿")
         # 逐级放大偏移重试（上下各 8/16px），成功即把该偏移记进学习表
         tries = ((0, -8), (0, 8), (0, -16), (0, 16))
         for i, (ox, oy) in enumerate(tries[:max(0, self.click_retry * 2)]):
@@ -403,6 +430,10 @@ class UI:
         start = time.time()
         end = start + timeout
         started = False
+        # 2026-11-19 假成功审计（audit2 B2）：调用方把 True 当「已离开战斗」，
+        # 但宽限期到点也没见过战斗态时同样返回 True —— 于是扫荡/宝箱全点在布阵页上。
+        # 现在用 battle_started 把两种 True 区分开，调用方能据此重试。
+        self.battle_started = False
         first = im
         while time.time() < end:
             cur = first if first is not None else self.screen(label)
@@ -410,14 +441,16 @@ class UI:
             st = self.state(cur)
             if st == State.BATTLE:
                 started = True
+                self.battle_started = True
                 self.battle_skip(cur, ms=ms, label=label, quiet=True)
                 self.wait(1.2)
                 continue
             if started:
                 return True          # 打过再离开 = 真的结算了
             if time.time() - start >= grace:
-                # 宽限期内一直没见到战斗态：这场压根没打起来（次数/等级限制等），
-                # 交给调用方自己判，别在这儿死等。
+                # 宽限期内一直没见到战斗态：这场压根没打起来（次数/等级限制）或加载慢。
+                log.info(f"  battle_finish：宽限期 {grace:.0f}s 内没见到战斗画面"
+                         f"（按钮没注册上/加载慢/次数不足），按「这场没打起来」返回")
                 return True
             self.wait(0.6)
         return self.state() != State.BATTLE
@@ -539,6 +572,34 @@ class UI:
         return False
 
     # ---------- 干扰处理 ----------
+    def restart_game(self, tries: int = 2, reason: str = "重连弹窗关不掉") -> bool:
+        """兜底：adb 杀掉游戏重开（2026-11-19）。
+
+        `logs/_f52.log` 01:27 那次：OCR 认不到按钮、5 个候选点全空，弹窗一直压在
+        画面上，后面的任务全靠自愈爬。这里直接 force-stop + am start，
+        重开后能回到主城就算处理成功。
+
+        `reason` 只用于日志（2026-11-19 07:27 黑屏加载也走这条路，日志里
+        别再写成「重连弹窗关不掉」）。
+        """
+        for i in range(tries):
+            log.warn(f"  {reason}：第 {i + 1}/{tries} 次杀掉游戏重开（约 40 秒）")
+            try:
+                self.dev.stop()
+            except Exception as exc:      # noqa: BLE001 - adb 挂了就下次再试
+                log.warn(f"  重启游戏：force-stop 失败（{exc}）")
+            time.sleep(3.0)
+            try:
+                self.dev.launch()
+            except Exception as exc:      # noqa: BLE001
+                log.warn(f"  重启游戏：launch 失败（{exc}）")
+                continue
+            time.sleep(10.0)
+            if self.state() != State.RECONNECT_LOGIN and self.ensure_main_city():
+                log.info("  重启游戏：已经回到主城，继续")
+                return True
+        return False
+
     def _reconnect_ok(self, im: Image.Image):
         """在断线弹窗里用 OCR 找「重新登录 / 确定 / 登录」按钮中心。
 
@@ -570,11 +631,114 @@ class UI:
             return ""
         return " ".join(t for t, _c, _bb, _s in lines)
 
+    def _agree_ticked(self, im) -> bool:
+        """标题页《用户协议》勾选框里有没有绿色勾。
+
+        真帧实测：勾选后绿色像素块中心 (126,1079)、bbox (117,1066,141,1088)；
+        未勾选时该区域是深蓝空框，绿色像素接近 0。
+        """
+        try:
+            box = L.TITLE_AGREE_BOX
+            n = 0
+            for y in range(box[1], box[3], 2):
+                for x in range(box[0], box[2], 2):
+                    R, G, B = im.getpixel((x, y))
+                    if G > 140 and G - R > 50 and G - B > 60:
+                        n += 1
+            return n >= 30
+        except Exception:
+            return False
+
     def _looks_like_title_start(self, im: Image.Image) -> bool:
         txt = self._title_start_text(im)
         if not txt:
             return True          # OCR 不可用：保持旧行为（直接点）
         return ("开始游戏" in txt) or ("进入游戏" in txt) or ("开始" in txt)
+
+    # ---------- 钻石确认框（2026-11-15） ----------
+
+    def diamond_prompt(self, im=None) -> int | None:
+        """屏幕上是不是「温馨提示：是否消耗 ?N 加速完成任务」这个钻石确认框。
+
+        命中返回弹窗里的钻石数（OCR 读不到具体数字时返回 -1），没命中返回 None。
+        2026-11-15 真帧（logs/_fx_bounty_prompt.png）：OCR(120,460,620,700) 稳定读到
+        「是否消耗 10加速完成任务 / 当前拥有： 11541」；左「取消」(254,766)、
+        右金「加速」(465,762)。第 42 轮 f42 的 10 钻就是没认出这个框、后续一点
+        正好落在金「加速」上花掉的。
+        """
+        if not textocr.available():
+            return None
+        if im is None:
+            im = self.screen()
+        try:
+            txt = textocr.read_text(im, L.DIAMOND_PROMPT_BOX) or ""
+        except Exception:      # noqa: BLE001 - OCR 挂了不能影响主流程
+            return None
+        flat = txt.replace(" ", "").replace("\n", "")
+        if not any(k in flat for k in L.DIAMOND_PROMPT_KEYS):
+            return None
+        m = re.search(r"消耗(\d{1,5})", flat)
+        return int(m.group(1)) if m else -1
+
+    def dismiss_diamond_prompt(self, im=None, tries: int = 2) -> bool:
+        """关掉「是否消耗 ?N 加速…」确认框：只点左侧「取消」，绝不点「加速」。
+
+        返回 True 表示**这个框存在且已被我们处理**（关掉或已尽力点过），调用方
+        应据此把当前动作判为失败、不要继续往下点；没有这个框返回 False。
+        """
+        cost = self.diamond_prompt(im)
+        if cost is None:
+            return False
+        log.info(f"  钻石确认框：游戏弹了「是否消耗 {cost if cost > 0 else '?'} 钻加速」，"
+                 f"点左侧「取消」（不替玩家花钱）")
+        for _ in range(max(1, int(tries))):
+            self.press(L.DIAMOND_PROMPT_CANCEL, 200,
+                       label="diamond_prompt_cancel", expect="none")
+            time.sleep(1.2)
+            if self.diamond_prompt() is None:
+                log.info("  钻石确认框：已关掉")
+                return True
+        log.warn("  钻石确认框：连点「取消」仍然在，停止本次动作（不乱点右侧金钮）")
+        return True
+
+
+    def clear_lineup_dialog(self, im=None, label: str = "lineup_save") -> bool:
+        """关掉「当前英雄布阵未保存 / 是否保存本次挑战？」这类浮层（2026-11-20）。
+
+        第 68 轮 02:20 的真因：副本列表上叠着
+        `温馨提示 / 本次挑战共造成伤害… / 是否保存本次挑战？`，固定的 `L.LINEUP_SAVE`
+        (465,782) 比按钮中心 (473,747) 低 35px，`_clear_overlay` 更是只点空白（点不动），
+        于是 gold/grade/equip 三个页签全被跳过，还把点击打到了关卡行上。
+        现在用 OCR 在按钮行里找「保存」的真实中心；读到「角斗券/上限」那类提示只点「取消」。
+        """
+        if im is None:
+            im = self.screen("lineup_chk")
+        if not vision.lineup_save_dialog(im):
+            return False
+        body = ""
+        try:
+            body = textocr.read_text(im, L.LINEUP_BODY_BOX)
+        except Exception:  # noqa: BLE001
+            body = ""
+        if any(k in body for k in L.LINEUP_BLOCK_KEYS):
+            log.info(f"  温馨提示：{body[:34]}（不是布阵保存，点「取消」关掉）")
+            self.press(L.LINEUP_CANCEL, 200, label="lineup_cancel", expect="none")
+            time.sleep(1.2)
+            return True
+        pos = None
+        try:
+            for t, c, _b, sc in textocr.read_lines(im, L.LINEUP_BTN_ROW_BOX, min_score=0.5):
+                if t.replace(" ", "") == L.LINEUP_SAVE_KEY:
+                    pos = c
+                    break
+        except Exception:  # noqa: BLE001
+            pos = None
+        if pos is None:
+            pos = L.LINEUP_SAVE
+        log.info(f"  布阵未保存提示：按文字定位到「保存」{pos}，点它退出布阵页")
+        self.press(pos, 200, label=label, expect="none")
+        time.sleep(1.6)
+        return True
 
     def handle_interruptions(self) -> bool:
         """退出确认 / 断线弹窗 / 布阵保存提示 / 结算页的确定。返回 True 表示处理过。"""
@@ -593,6 +757,11 @@ class UI:
             time.sleep(0.9)
             return True
         im = self.screen()
+        # 2026-11-15：先处理「是否消耗 ?N 加速…」钻石确认框。它 classify=UNKNOWN、
+        # 也不在 FAIL_DIALOG_KEYS 里，踩进下面的分支时「点空白」有可能正好落在
+        # 金色「加速」上（f42 21:36 就是这么白花 10 钻的）。这里一律点「取消」。
+        if self.dismiss_diamond_prompt(im):
+            return True
         # 2026-11-08：「挑战失败 / 通过以上途径增强实力」这类居中模态弹窗。
         # 它 classify=UNKNOWN、点 BACK 整屏 diff≈0.004，旧的 _escape_unknown 五个出口
         # 全都点不到「确定」——2026-11-07 因此让 relic 整轮卡在弹窗里（13 次 back_probe）。
@@ -616,10 +785,7 @@ class UI:
                 time.sleep(1.5)
                 return True
         if vision.lineup_save_dialog(im):
-            log.info("  布阵未保存提示：点「保存」退出布阵页")
-            self.press(L.LINEUP_SAVE, 220)
-            time.sleep(1.6)
-            return True
+            return self.clear_lineup_dialog(im)
         if st == State.RECONNECT:
             log.warn("断线：继续重连")
             self.press(L.RECONNECT, 200)
@@ -629,6 +795,12 @@ class UI:
                 return False
             return True
         if st == State.RECONNECT_LOGIN:
+            # 2026-11-19 02:50：付费商店页会把这个状态误判出来，先 OCR 确认，
+            # 认不到断线文案就一个点都不按（绝不盲点付费页）。
+            if not self._login_popup_confirmed(im):
+                log.info("  画面像断线弹窗，但读不到「重新登录」类文字（多是付费/活动页误判），只按一次 BACK 收手")
+                self.press(L.BACK, 220, label="login_false_pos_back", expect="none")
+                return False
             log.warn("断线：需要重新登录")
             # 2026-11-10 第 41 轮 10:54:53：固定点 (360,748) 点下去 diff=0.000，
             # 4 个补偿点也没反应，弹窗根本没被关掉。
@@ -638,7 +810,23 @@ class UI:
                 log.info(f"  重连弹窗：按文字定位到按钮 {pos}，点它")
                 self.press(pos, 200, label="reconnect_login_ok_ocr", expect="none")
             else:
-                self.press(L.RECONNECT_LOGIN_OK, 200)
+                # 2026-11-19：OCR 认不到按钮时，原来直接盲按固定点 (360,748)，
+                # 实测 diff=0.000，还带 4 个补偿点空转（空点 WARN 就是它）。
+                # 改成候选点逐个轻按，每按一次回看是否已离开断线页，不行就放弃。
+                closed = False
+                for cand in L.RECONNECT_LOGIN_CANDS:
+                    self.press(cand, 200, label="reconnect_login_cand", expect="none")
+                    time.sleep(1.5)
+                    if self.state() != State.RECONNECT_LOGIN:
+                        log.info(f"  重连弹窗：候选点 {cand} 命中，弹窗已关")
+                        closed = True
+                        break
+                if not closed:
+                    log.warn("  重连弹窗：OCR 与候选点都没能关掉它，改用「杀掉游戏重开」兜底")
+                    if self.restart_game():
+                        return True
+                    log.warn("  重连弹窗：重启游戏也没能回到主城，这次先不点了")
+                    return False
             time.sleep(2.5)
             if self.state() == State.RECONNECT_LOGIN:
                 log.warn("  断线弹窗没关掉，停止连点")
@@ -646,6 +834,31 @@ class UI:
             self.login()
             return True
         return False
+
+    def _login_popup_confirmed(self, im=None) -> bool:
+        """这页到底是不是断线「需要重新登录」弹窗？（OCR 一次，40 秒内只判一次）
+
+        2026-11-19 02:50 事故：付费商店页「福利礼包」被判成 RECONNECT_LOGIN，
+        handle_interruptions 对着它盲点 5 次。这里用文字兜底，宁可不动也不乱点。
+        """
+        now = time.time()
+        if now - getattr(self, "_rl_at", 0.0) < 40.0:
+            return bool(getattr(self, "_rl_ok", False))
+        self._rl_at = now
+        if im is None:
+            im = self.screen("login_confirm")
+        ok = False
+        try:
+            if textocr.available():
+                txt = (textocr.read_text(im, L.RECONNECT_LOGIN_BOX) or "").replace(" ", "")
+                pay = any(k in txt for k in L.RECONNECT_PAY_KEYS)
+                ok = bool(txt) and (not pay) and any(k in txt for k in L.RECONNECT_LOGIN_TEXTS)
+                if pay:
+                    log.info(f"  这页有付费字样（{txt[:40]}），不是断线弹窗，不乱点")
+        except Exception:            # noqa: BLE001
+            ok = False
+        self._rl_ok = ok
+        return ok
 
     # ---------- 页面根节点 ----------
     def foreign_app(self) -> str:
@@ -696,11 +909,36 @@ class UI:
                     return False
             st = self.state()
             if st == State.MAIN_CITY:
+                self._loading_n = 0
                 log.arrived("main", time.time() - t0)
                 return True
             if self._landscape():
                 log.warn("  画面变成横屏（模拟器被其它脚本切走），停止点击")
                 return False
+            if st == State.LOADING:
+                # 2026-11-19 06:54 事故：黑屏加载落到 UNKNOWN → 「没有可用出口」→ 连着
+                # 两个任务回不到主城 → 整轮中止。这里改成：先等，等太久就杀掉重开。
+                self._loading_n = getattr(self, "_loading_n", 0) + 1
+                if self._loading_n >= 8:
+                    log.warn(f"  黑屏加载已持续 {self._loading_n * 3:.0f}s，杀掉游戏重开")
+                    self._loading_n = 0
+                    self.restart_game(reason="黑屏加载卡住")
+                else:
+                    if self._loading_n == 1:
+                        log.info("  画面是黑屏加载态（游戏重启/切场景），先等它")
+                    if self._loading_n == 4:
+                        # 2026-11-19：整轮里每小时左右会出现一次黑屏（09:29 / 10:25 /
+                        # 11:38 / 12:43 都是），而杀掉重开要 ~80-180s。先试便宜的一招：
+                        # 把 **同一个 Activity 再 am start 一次**（不杀进程），
+                        # 常能把丢掉的 surface 重新挂上；不行再等它到第 8 次重开。
+                        log.info("  黑屏 12s 未恢复，先试着把游戏窗口重新拉到前台（不杀进程）")
+                        try:
+                            self.dev.launch()
+                        except Exception as exc:      # noqa: BLE001
+                            log.info(f"  重新拉前台失败（{exc}），继续等")
+                        time.sleep(1.5)
+                    time.sleep(3.0)
+                continue
             if st == State.MAIN_CITY_DIM:
                 self.close_popup()
                 continue
@@ -720,12 +958,26 @@ class UI:
                     self.press(L.BACK, 220, label="title_misjudge_back", expect="none")
                     time.sleep(1.6)
                     continue
-                R, G, B = vision.avg(shot, *L.TITLE_AGREE, r=12)
-                if not (G > 110 and G - R > 45 and G - B > 35):
+                # 2026-11-19 06:06 实测：勾选框中心在 (126,1078)（旧 (128,1119) 落在
+                # 协议文字下方，点了完全没反应 → 一路空点到「登录超时」）。
+                # 已勾选时再点会把勾去掉，所以先数绿色勾像素再决定点不点。
+                if self._agree_ticked(shot):
+                    log.info("  标题页：协议已勾选，不重复点勾选框")
+                else:
                     self.press(L.TITLE_AGREE, 180, label="title_agree", expect="none")
-                    time.sleep(0.8)
+                    time.sleep(0.9)
+                before = self.state()
                 self.press(L.TITLE_START, 220, label="title_start", expect="none")
                 time.sleep(6.0)
+                after = self.state()
+                if after == State.TITLE and before == after:
+                    self._title_stuck = getattr(self, "_title_stuck", 0) + 1
+                    if self._title_stuck >= 2:
+                        log.warn("  标题页：点了两次「开始游戏」画面都没变，改用「杀掉游戏重开」兜底")
+                        self._title_stuck = 0
+                        self.restart_game()
+                else:
+                    self._title_stuck = 0
                 continue
             if st == State.SUMMON_RESULT:
                 # 2026-11-05：bp 免费一抽后的召唤结果页，返回键无效，只能点左「返回」
@@ -814,9 +1066,25 @@ class UI:
                     State.RESULT_DEFEAT: (235, 1055),   # 失败页的「确定」，点空白关不掉
                 }[st]
                 if st == State.RESULT_DEFEAT:
-                    # 塔失败页「确定」在左 (235,1055)，时光之树失败页「确定」在正中 (360,1060)
+                    # 塔失败页「确定」在左 (235,1055)、时光之树在正中 (360,1060)，
+                    # 公会排位赛在 (363,1136) —— 位置因玩法而异，先 OCR 认底部「确定」。
+                    # 2026-11-18 事故：排位赛失败页上旧的两个候选点都空，BACK 也无效，
+                    # ensure_main_city 连续 8 轮「没能回到主城」，整轮 FAIL。
                     shot = self.screen("defeat")
-                    pos = (360, 1060) if vision.is_gold(shot, 360, 1060, r=16) else pos
+                    pos = None
+                    if textocr.available():
+                        try:
+                            for _t, _c, _bb, _s in textocr.read_lines(
+                                    shot, L.DEFEAT_OK_ZONE, min_score=0.5):
+                                if "确定" in _t:
+                                    pos = (int(_c[0]), int(_c[1]))
+                                    break
+                        except Exception:   # noqa: BLE001
+                            pos = None
+                    if pos is None:
+                        pos = (360, 1060) if vision.is_gold(shot, 360, 1060, r=16) else pos
+                    if pos is None:
+                        pos = (235, 1055)
                 self.press(pos, 220)
                 time.sleep(1.6)
                 continue

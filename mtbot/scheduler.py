@@ -81,8 +81,15 @@ class Scheduler:
         """跑一次任务，带单任务超时看门狗；异常都在这里收口成 TaskResult。"""
         import traceback
 
-        minutes = int(self.cfg.runtime.max_task_minutes)
+        # 2026-11-19 用户反馈「全部任务一起跑会在某一个任务卡住」：
+        # ① 单任务默认 20 分钟（原来 40 分钟），② 塔这种天然一场接一场的
+        #    任务用自己的 params.timeout_minutes 覆盖，③ 超时的任务不再重试
+        #    （重试只会再卡 20 分钟），④ 另有「卡死看门狗」见 Scheduler.run。
+        minutes = int(getattr(task, "p", {}).get("timeout_minutes",
+                                                  self.cfg.runtime.max_task_minutes)
+                      or self.cfg.runtime.max_task_minutes)
         self.ui.deadline = time.time() + minutes * 60 if minutes > 0 else None
+        self._task_minutes = minutes
         try:
             return task.run(self.ctx)
         except OasYield as e:
@@ -91,7 +98,7 @@ class Scheduler:
             log.warn(f"  {name} 让位给阴阳师（{e}）")
             return TaskResult.fail(f"运行已中止：让位给阴阳师（{e}）")
         except TaskTimeout as e:
-            log.error(f"  {name} 超时（>{minutes} 分钟）: {e}")
+            log.error(f"  {name} 超时（>{self._task_minutes} 分钟）: {e}")
             return TaskResult.fail(f"超时: {e}")
         except Exception as e:  # noqa: BLE001
             log.error(f"  {name} 异常: {e}")
@@ -105,15 +112,79 @@ class Scheduler:
         finally:
             self.ui.deadline = None
 
+    def _revive_device(self) -> bool:
+        """设备挂了就把它救回来（2026-11-20）。
+
+        以前模拟器整机挂掉（第 64 轮）后，`ensure_main_city()` 一直抛错，
+        连续两个任务回不到主城就整轮中止，后面十几个任务白丢。现在先救设备。
+        """
+        try:
+            dev = getattr(self.ui, "dev", None)
+            if dev is None or not hasattr(dev, "recover"):
+                return False
+            if dev.alive():
+                return True
+            return bool(dev.recover())
+        except Exception as e:  # noqa: BLE001
+            log.warn(f"  救设备出错（{e}）")
+            return False
+
     def _recover(self) -> None:
         """失败自愈：尽量回到主城，避免一个任务失败后后续任务全部跑偏。"""
         try:
             ok = self.ui.ensure_main_city()
             log.info(f"  自愈：{'已回到主城' if ok else '未确认回到主城'}")
+            return
         except Exception as e:  # noqa: BLE001
-            log.warn(f"  自愈失败（{e}），继续下一个任务")
+            log.warn(f"  自愈失败（{e}）")
+        if self._revive_device():
+            try:
+                ok = self.ui.ensure_main_city()
+                log.info(f"  自愈：设备已救回，{'已回到主城' if ok else '仍未确认回到主城'}")
+                return
+            except Exception as e:  # noqa: BLE001
+                log.warn(f"  自愈仍失败（{e}），继续下一个任务")
+        log.warn("  自愈结束，继续下一个任务")
 
     # ---------- 执行 ----------
+    # 2026-11-19：任务里完全没有点击动作超过这个秒数，就判卡死。
+    STALL_SECONDS = 480.0
+    WATCHDOG_TICK = 15.0
+
+    def _start_watchdog(self):
+        """卡死看门狗（2026-11-19，用户反馈「全部任务一起跑会在某一个任务卡住」）。
+
+        任务卡死的典型形态是「不再发出任何点击」（等一个永远不来的页面、
+        在 while 循环里只截图）。ui.deadline 的 20 分钟兜底太晚，
+        这里用独立线程每 15s 看一次 `ui.actions`：8 分钟不动就把
+        `ui.deadline` 直接设成过去时间 —— 主线程下一次 screen/press/wait
+        进 `_check_deadline()` 就会抛 TaskTimeout，整个任务被立刻收口。
+        线程只改这个时间戳，不碰设备，避免和主线程的操作打架。
+        """
+        import threading
+
+        stop = threading.Event()
+
+        def _loop():
+            last = self.ui.actions
+            ts = time.time()
+            while not stop.wait(self.WATCHDOG_TICK):
+                cur = self.ui.actions
+                if cur != last:
+                    last, ts = cur, time.time()
+                    continue
+                idle = time.time() - ts
+                if idle < self.STALL_SECONDS or self.ui.deadline is None:
+                    continue
+                log.warn(f"  看门狗：{idle:.0f}s 内一次点击都没有（{self.ui.task_name}），"
+                         f"判定卡住，立即中止本任务")
+                self.ui.stall_note = f"卡死看门狗：{idle:.0f} 秒没有任何点击动作"
+                self.ui.deadline = time.time() - 1
+                ts = time.time()
+        t = threading.Thread(target=_loop, name="mtbot-watchdog", daemon=True)
+        t.start()
+        return stop
+
     def run(self, names: list[str]) -> dict[str, TaskResult]:
         import inspect
         import traceback
@@ -121,6 +192,7 @@ class Scheduler:
         state = self._load_state()
         results: dict[str, TaskResult] = {}
         log.info(f"共 {len(names)} 个任务: {', '.join(names)}")
+        wd_stop = self._start_watchdog()
         aborted = ""
         stuck_backs = 0        # 连续多少个任务结束后回不到主城
         for i, name in enumerate(names, 1):
@@ -160,6 +232,10 @@ class Scheduler:
             for attempt in range(attempts):
                 res = self._run_once(task, name)
                 if res.ok or attempt + 1 >= attempts:
+                    break
+                if str(res.message).startswith("超时"):
+                    # 2026-11-19：卡住超时的任务立刻放弃，重试只会再卡一遍
+                    log.warn(f"  {name} 是卡住超时，不再重试（重试只会再卡一遍）")
                     break
                 log.warn(f"  {name} 失败（{res.message}），自愈后重试 "
                          f"{attempt + 1}/{attempts - 1}")
@@ -207,9 +283,16 @@ class Scheduler:
             # 任务之间保证回到主城，避免前一个任务把界面留在奇怪的位置
             try:
                 back_ok = self.ui.ensure_main_city()
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 back_ok = False
-                log.warn("回主城出错")
+                log.warn(f"回主城出错（{e}）")
+                # 2026-11-20：先判是不是设备挂了，救回来再试一次，别急着中止整轮
+                if self._revive_device():
+                    try:
+                        back_ok = self.ui.ensure_main_city()
+                    except Exception as e2:  # noqa: BLE001
+                        back_ok = False
+                        log.warn(f"  设备救回后仍回不了主城（{e2}）")
             stuck_backs = 0 if back_ok else stuck_backs + 1
             if stuck_backs >= 2:
                 # 2026-11-05：连续两个任务都回不到主城 = 界面卡在无法退出的硬页面，
@@ -219,8 +302,17 @@ class Scheduler:
                 for rest in names[i:]:
                     results.setdefault(rest, TaskResult.fail("运行已中止：" + aborted))
                 break
+        wd_stop.set()
         ok = sum(1 for r in results.values() if r.ok)
         if aborted:
             log.error(f"本次运行被中止：{aborted}")
-        log.info(f"完成 {ok}/{len(results)} 个任务")
+        # 2026-11-19 审计：`跳过：…` 也是一种「OK」（今天确实没事可做），但它没有干活，
+        # 全算在一起会让人以为整轮都真跑了。这里把两者拆开报。
+        skipped = sum(1 for r in results.values()
+                      if r.ok and (r.message or "").startswith("跳过"))
+        if skipped:
+            log.info(f"完成 {ok}/{len(results)} 个任务"
+                     f"（真干活 {ok - skipped} 个，真状态跳过 {skipped} 个）")
+        else:
+            log.info(f"完成 {ok}/{len(results)} 个任务")
         return results

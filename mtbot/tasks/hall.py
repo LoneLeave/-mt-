@@ -32,13 +32,18 @@ class HallLikeTask(BaseTask):
         except Exception:  # noqa: BLE001
             return ""
 
-    def _at_page(self, im) -> bool:
+    def _at_page(self, im) -> bool | None:
+        """在殿堂页 → True；明确不在 → False；读不出（OCR 不可用/异常）→ None。
+
+        2026-11-20 审计 MAJOR：原来「读不出」直接 return True，然后在主城画面上
+        盲点 (361,1254) 点「点赞」。现在把「不知道」交回调用方，按不点处理。
+        """
         if not textocr.available():
-            return True
+            return None
         try:
             head = textocr.read_text(im, L.HALL_PAGE_BOX) or ""
         except Exception:  # noqa: BLE001
-            return True
+            return None
         return any(k in head for k in L.HALL_PAGE_KEYS)
 
     def run(self, ctx: TaskContext) -> TaskResult:
@@ -48,7 +53,14 @@ class HallLikeTask(BaseTask):
         ui.press(L.HALL_ENTRY, 250, label="hall_entry", expect="none")
         ui.wait(2.6)
         im = ui.screen("hall_open")
-        if not self._at_page(im):
+        at_page = self._at_page(im)
+        if at_page is None:
+            log.info("  荣耀殿堂：读不出殿堂标题（OCR 不可用/异常），不点任何按钮，退回")
+            ui.press(L.BACK, 250, label="hall_back_unknown", expect="none")
+            ui.wait(1.2)
+            MainCity(ui).ensure()
+            return TaskResult.skip("荣耀殿堂读不出页面（OCR 异常），本次不点")
+        if not at_page:
             log.info("  荣耀殿堂：(382,532) 没进去（页面读不到殿堂标题），退回不动")
             ui.press(L.BACK, 250, label="hall_back", expect="none")
             ui.wait(1.2)
@@ -63,6 +75,17 @@ class HallLikeTask(BaseTask):
             return TaskResult(True, "荣耀殿堂：今天已点赞（奖励已领）",
                               {"liked": False, "noop_ok": True})
 
+        if not vision.is_gold(im, *L.HALL_LIKE, r=18):
+            # 2026-11-20 审计 MAJOR：点赞前要有「这里确实是点赞钮」的证据
+            # （金钮，或底部文字里读得到「点赞」），否则不按固定坐标盲点。
+            said_like = "点赞" in bottom
+            if not said_like:
+                log.info("  荣耀殿堂：底部既不是金钮、也读不到「点赞」字样，本次不点")
+                ui.press(L.BACK, 250, label="hall_back_nolike", expect="none")
+                ui.wait(1.2)
+                MainCity(ui).ensure()
+                return TaskResult.skip("荣耀殿堂底部没有可见的点赞钮，本次不点")
+            log.info("  荣耀殿堂：点赞钮不是金钮，但底部读得到「点赞」字样，照常点")
         ui.press(L.HALL_LIKE, 250, label="hall_like", expect="none")
         ui.wait(2.4)
         pop = ui.screen("hall_pop")

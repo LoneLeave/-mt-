@@ -38,6 +38,14 @@ class MerchantTask(BaseTask):
 
         if not MainCity(ui).ensure():
             return TaskResult.fail("回不到主城")
+        # 2026-11-20 审计 CRITICAL：确认框里「花费 💎-154」被当成「商人倒给你钻」，
+        # 全流程没有任何主城钻石前后差核对 —— 符号判错就是静默真花钻还报「已购买」。
+        # 现在进页前先记一次主城钻石（读两帧一致才采纳），成交后再读一次对比。
+        d0 = self.diamonds_stable(ui, "merchant_d0") if not cancel_only else None
+        if d0 is None and not cancel_only:
+            log.info("  公会商人：进页前读不到主城钻石（读数缺证），成交后只能按「有没有证据」判")
+        elif d0 is not None:
+            log.info(f"  公会商人：进页前主城钻石 {d0}")
         page = MerchantPage(ui)
         if not page.enter():
             return TaskResult.skip("进不去公会商人")
@@ -57,12 +65,15 @@ class MerchantTask(BaseTask):
             if not page.bargain():
                 # 底部不是金色「议价」（本阶段已是灰「已购买/议价上限」），再点也是空转
                 break
-            n += 1
             im = ui.screen("merchant_bargain")
             val, sc = page.discount(im)
             if val is None:
-                log.warn(f"  公会商人：第 {n} 次议价后折扣读不出（{sc:.2f}），停止议价")
+                # 2026-11-19 假成功审计（audit2 TOP10）：以前先 n += 1 再读折扣，
+                # 读不出时这一轮已经计进 bargains。现在读到了才计。
+                log.warn(f"  公会商人：第 {n + 1} 次点「议价」后折扣读不出（{sc:.2f}），"
+                         f"停止议价（这次不计入议价次数）")
                 break
+            n += 1
             can_push = "还能继续压" if n < max_bargains else "已到次数上限"
             log.info(f"  公会商人：第 {n} 次议价 → 折扣 -{val}（{sc:.2f}），{can_push}")
             if val == last:
@@ -93,7 +104,17 @@ class MerchantTask(BaseTask):
         log.info(f"  公会商人：折扣 -{disc}（已过 -{need} 阈值），购买结果：{said}")
         page.back_to_guild()
         MainCity(ui).ensure()
-        stats = {"discount": -disc, "bargains": n, "bought": ok, "state": state}
+        d1 = self.diamonds_stable(ui, "merchant_d1")
+        stats = {"discount": -disc, "bargains": n, "bought": ok, "state": state,
+                 "diamonds_before": d0, "diamonds_after": d1}
+        if ok and d0 is not None and d1 is not None and d1 < d0:
+            # 成交却把钻石花掉了 = 那次「倒给你的钻」判断是错的（或当期文案改了）
+            log.warn(f"  公会商人成交扣了钻石：{d0} → {d1}（少了 {d0 - d1}），"
+                     f"说明「花费 💎-N 是收入」的判断不成立，请核对")
+            return TaskResult.fail(
+                f"公会商人：{said}，但主城钻石 {d0}→{d1} 少了 {d0 - d1}，怀疑真花钻了", stats)
+        if ok and d0 is not None and d1 is not None:
+            log.info(f"  公会商人：成交后主城钻石 {d0}→{d1}（没少），与「倒给你钻」的判断一致")
         if state == "no_confirm":
             # 2026-11-09 假成功审计：点了购买却连确认框都没弹 → 脚本没点通，不能报 OK
             return TaskResult.fail(f"公会商人：折扣 -{disc}，{said}（按钮/确认框都没接通）", stats)

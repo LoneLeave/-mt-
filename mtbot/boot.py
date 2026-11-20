@@ -60,8 +60,23 @@ def bootstrap(cfg: Config, ui, cold: bool = False, use_emulator: bool = False,
         # 1. 选实例
         ok(f"实例 {cfg.device.serial}（包 {cfg.device.package}）")
 
-        # 2. adb connect
+        # 2. 先确保模拟器实例在跑
+        # 2026-11-20：以前这一步失败就直接 return，根本没机会执行后面第 5 步的
+        # `Emulator.start()`（它在 adb 连上之后才跑）—— 于是「--boot 拉不起模拟器」。
+        # 现在先看实例死活，没起来就先拉，最多等 240s。
         dev = ui.dev
+        em = None
+        if use_emulator and cfg.emulator.start:
+            em = Emulator(cfg)
+            if not em.is_running():
+                ok("模拟器没在跑，先启动实例")
+                em.start()
+                if em.wait_android(240):
+                    ok("模拟器实例已启动")
+                else:
+                    retry(max_retry, max_retry, "模拟器实例 240s 没起来，继续试着连 adb")
+
+        # 2b. adb connect
         connected = False
         for i in range(1, max_retry + 1):
             try:
@@ -74,6 +89,21 @@ def bootstrap(cfg: Config, ui, cold: bool = False, use_emulator: bool = False,
             except DeviceError as e:
                 retry(i, max_retry, f"{e}")
                 if i < max_retry:
+                    time.sleep(4)
+        if not connected and em is not None:
+            # 实例刚拉起来时 adb 端口往往还没就绪，再给一次机会
+            retry(max_retry, max_retry, "adb 还是连不上，把模拟器实例重新拉一次再等 180s")
+            em.start()
+            em.wait_android(180)
+            for i in range(1, max_retry + 1):
+                try:
+                    dev.adb("connect", cfg.device.serial, timeout=10)
+                    if dev.shell("getprop sys.boot_completed").strip() == "1":
+                        connected = True
+                        ok(f"adb 已连接 {cfg.device.serial}")
+                        break
+                except DeviceError as e:
+                    retry(i, max_retry, f"{e}")
                     time.sleep(4)
         if not connected:
             fail(f"adb 连不上 {cfg.device.serial}",
@@ -109,8 +139,8 @@ def bootstrap(cfg: Config, ui, cold: bool = False, use_emulator: bool = False,
         ok(f"游戏包存在（{path.splitlines()[0]}）")
 
         # 5. 启动/切前台
-        if use_emulator and cfg.emulator.start:
-            Emulator(cfg).start()
+        if use_emulator and cfg.emulator.start and em is not None:
+            em.start()          # 幂等：已在跑就直接返回
         if cold:
             dev.stop()
         for i in range(1, max_retry + 1):

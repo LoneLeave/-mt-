@@ -11,6 +11,9 @@ from .assist import (ArtifactTask, AssistMarkTask, GloryBookTask, InheritTask,
                      PetTask)
 from .ancestor import AncestorTask
 from .tavern import TavernTask
+from .weapon import WeaponTask
+from .tianshen import TianshenTask
+from .qianchou import QianchouTask
 from .guild_rank import GuildRankTask
 from .arena import ArenaTask
 from .glory import GloryTask
@@ -26,7 +29,7 @@ from .heroes import CollectionTask, HeroBondTask
 from .merchant import MerchantTask
 from .rankboard import RankBoardTask
 from .reward import (BattlePassTask, EquipmentTask, FriendTask,
-                     HeroLevelTask, MailTask, RankTask, RelicTask, StarUpTask,
+                     HeroLevelTask, MailTask, RelicTask, StarUpTask,
                      WelfareTask)
 from .soul import SoulTask
 
@@ -35,6 +38,7 @@ TASK_CLASSES: dict[str, type[BaseTask]] = {
         # 战斗
         AncestorTask,
     TavernTask,
+    WeaponTask, TianshenTask, QianchouTask,
     GuildRankTask,
     ArenaTask,
     GloryTask,
@@ -42,7 +46,7 @@ TASK_CLASSES: dict[str, type[BaseTask]] = {
         TowerTask, LegendTask, TreeTask, DemonTask, DragonTask, FactionTask,
         DungeonTask, SoulTask, GoblinTask, GuildTrialTask, GuildBeastTask, CampaignTask,
         # 奖励
-        MailTask, RankTask, FriendTask, WelfareTask, BattlePassTask, ClaimDailyTask,
+        MailTask, FriendTask, WelfareTask, BattlePassTask, ClaimDailyTask,
         RankBoardTask, BountyTask, MerchantTask, QuickIdleTask, ShopRefreshTask,
         GuildDonateTask,
         # 提升（助阵四个子系统 + 英雄页助战徽记各自独立，方便单独调试）

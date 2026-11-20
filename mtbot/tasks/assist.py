@@ -41,6 +41,20 @@ def _changed(a, b, box, thr: float = 0.002) -> bool:
 class _AssistBase(BaseTask):
     category = "upgrade"
 
+    # 面板顶部「传说/神话 + ★★★★★ + 名字」那一行（真帧 tests/fixtures/artifact_star_popup.png：
+    # 800级(107,164) / ★★★★★(359,180) / 安魂之杖+1(359,209)）。升星是否生效只认
+    # 这一行里 ★ 的个数变化，像素变化一律不落账。
+    STAR_BOX = (60, 150, 660, 215)
+
+    def _stars(self, im) -> int | None:
+        """读当前星级（★ 字符数）。读不到返回 None —— 调用方必须按「缺证」处理。"""
+        try:
+            txt = textocr.read_text(im, self.STAR_BOX) or ""
+        except Exception:      # noqa: BLE001
+            return None
+        n = txt.count("\u2605")
+        return n if n >= 1 else None
+
     # 2026-11-03：底部大按钮若是橙色，是否视为「进阶/突破」并需要 allow_advance 开关。
     # 只有天神传承会把它设成 True；其它面板（荣耀之书/战宠等）保持旧行为。
     ORANGE_MEANS_ADVANCE = False
@@ -147,6 +161,11 @@ class _AssistBase(BaseTask):
                                  "要进阶请在任务参数里设 allow_advance=true")
                         break
                     log.info(f"  {label}：allow_advance=true，执行一次进阶")
+            if not vision.is_gold(im, *L.ASSIST_UPGRADE_BTN, r=18):
+                # 2026-11-20 审计 MAJOR：这行原来是固定坐标盲点（荣耀之书/战宠/神器都走
+                # 这条路）。现在要求该位置确实是金钮（可点），否则不点、按「已到上限」收手。
+                log.info(f"  {label}：升级钮不是金钮（材料不足/已到上限），本轮不点")
+                break
             ui.press(L.ASSIST_UPGRADE_BTN, 250, expect="none")
             ui.wait(2.0)
             after = ui.screen("assist_up2")
@@ -159,7 +178,7 @@ class _AssistBase(BaseTask):
             if self._dialog_open(ui, after):
                 done += self._dialog_loop(ui, label)
                 break
-            if vision.confirm_dialog(after):
+            if vision.dialog_confirm(after):
                 for p in ((465, 697), (360, 805), (360, 905), (465, 760)):
                     if vision.is_gold(after, *p, r=16):
                         ui.press(p, 220)
@@ -180,6 +199,16 @@ class _AssistBase(BaseTask):
                 if done == 0:
                     log.info(f"  {label}：点了没反应（按钮当前不可用）")
                 break
+            # 2026-11-18：第 44 轮出现过「升级 ×1 但等级没变」——真因是材料不足窗
+            # 弹了一下又自动关掉，2.0s 后抓的那一帧只是浮层残留，`_changed` 就为真。
+            # 再等 0.9s 抓一帧：只有变化仍然在，才算真的升动；否则按「闪一下」处理。
+            ui.wait(0.9)
+            again = ui.screen("assist_up_chk")
+            if not _changed(before, again, self.CHANGE_BOX):
+                if done == 0:
+                    log.info(f"  {label}：画面只是闪了一下（多半是材料不足窗弹了又关），不算升级")
+                break
+            after = again
             done += 1
             log.info(f"  {label}：升级 ×{done}")
             im = after
@@ -242,11 +271,18 @@ class GloryBookTask(_AssistBase):
             if n <= 0:
                 tried.add(idx)
                 continue
-            total += n
-            tried.clear()
             after = self._levels(ui)
-            log.info(f"  荣耀之书：{name} 升级一次（{lv} → {after[idx] if after[idx] is not None else '?'}），"
-                     f"当前四职业 {after}")
+            now = after[idx] if idx < len(after) else None
+            # 2026-11-18：第 44 轮 `辅助(65级)：升级 ×1` 但立刻复读仍是 65 ——
+            # `_upgrade_loop` 的像素变化判定把「材料不足窗弹了又关」当成了升级。
+            # 升级必须由等级数字自证：没变大就当材料不足，不计入、也不再试这一职业。
+            if now is None or now <= lv:
+                log.info(f"  荣耀之书：{name} 点了没升动（{lv} → {now if now is not None else '?'}），按材料不足处理")
+                tried.add(idx)
+                continue
+            total += now - lv
+            tried.clear()
+            log.info(f"  荣耀之书：{name} 升级一次（{lv} → {now}），当前四职业 {after}")
         return total
 
     def run(self, ctx: TaskContext) -> TaskResult:
@@ -439,7 +475,11 @@ class ArtifactTask(_AssistBase):
                 # 2026-11-04 根因修复：1号=2号=56 时 second 也=56，旧逻辑 lv>=second 立刻 break，
                 # 于是「连续两轮没升动、收手」——等级永远不变。并列最低时必须至少升 1 级。
                 second = low_lv + 1
-                log.info(f"  神器：最低等级并列（{low_lv} 级多件），先升 1 号到 {second} 级")
+                try:
+                    _ord = L.ARTIFACT_CARDS.index(low_x) + 1
+                except ValueError:
+                    _ord = 1
+                log.info(f"  神器：最低等级并列（{low_lv} 级多件），先升 {_ord} 号到 {second} 级")
             self._select(ui, low_x)
             hint = self._hint_text(ui)
             if "共鸣" in hint:      # 「共鸣」
@@ -454,6 +494,7 @@ class ArtifactTask(_AssistBase):
             # 现在读不到等级时用扫描阶段的 low_lv 当基准继续点，靠「等级变大 / 等级带变化」判成败。
             cur = low_lv
             blind = 0
+            suspect = 0
             for _ in range(40):
                 st, lv, im = self._level_once(ui)
                 if st == "advance":
@@ -486,17 +527,18 @@ class ArtifactTask(_AssistBase):
                     log.info(f"  神器·升级：{cur} → {lv2}（最低那件）")
                     cur = lv2
                     before_lv = after
-                elif lv2 is None and vision.diff_ratio(before_lv, after, L.ARTIFACT_CARD_LV_BAND) >= 0.01:
-                    # 等级数字仍被高亮盖着，但等级带像素变了 → 认为升级成功
-                    total += 1
-                    cur += 1
-                    blind += 1
-                    before_lv = after
-                    log.info(f"  神器·升级：读不到数字，但等级带已变化 → 记为 {cur} 级")
+                    suspect = 0
                 elif vision.diff_ratio(before_lv, after, L.ARTIFACT_CARD_LV_BAND) >= 0.01:
-                    total += max(1, lv2 - cur) if lv2 is not None else 1
-                    cur = lv2 if lv2 is not None else cur + 1
+                    # 2026-11-19 假成功审计（audit2 TOP3）：等级带 1% 像素变化只说明
+                    # 「那里有东西动了」（高亮切换/数字过渡动画也算），不能当升级证据。
+                    # 记为疑似、不落账；下一轮按真实等级结算。
+                    suspect += 1
                     before_lv = after
+                    log.info(f"  神器·升级：等级带变了但读不到更高的等级（疑似，不计数），"
+                             f"下一轮按真实等级结算（第 {suspect} 次）")
+                    if suspect >= 2:
+                        log.info("  神器：连续 2 次只看到像素变化、读不到等级 → 停手（不虚报升级数）")
+                        break
                 else:
                     blind += 1
                     log.info(f"  神器：点了没反应（当前 {cur} 级，第 {blind} 次），停手")
@@ -531,7 +573,21 @@ class ArtifactTask(_AssistBase):
         if bool(self.p.get("star", True)):
             ui.press(L.ARTIFACT_TABS[0], 220, label="artifact_tab_star", expect="none")  # 升星页签
             ui.wait(1.5)
-            total += self._upgrade_loop(ui, "神器·升星")
+            # 2026-11-20 审计 MAJOR：升星段原来直接把 _upgrade_loop 的「像素变化次数」
+            # 加进 total —— 高亮/数字过渡也会让像素动，等于虚报。现在先读 ★ 个数，
+            # 升完再读一次，只认真实星数增量；读不到就按缺证记 0，绝不虚报。
+            star_before = self._stars(ui.screen("art_star_ready"))
+            guessed = self._upgrade_loop(ui, "神器·升星")
+            star_after = self._stars(ui.screen("art_star_done"))
+            if star_before is not None and star_after is not None:
+                real = max(0, star_after - star_before)
+                if real != guessed:
+                    log.info(f"  神器·升星：像素判定 {guessed} 次，★ {star_before} → "
+                             f"{star_after} 实际只涨 {real} → 按 {real} 记")
+                total += real
+            else:
+                log.info(f"  神器·升星：读不到 ★ 数量（{star_before} → {star_after}），"
+                         f"无法核实升星次数 → 本轮按 0 记（不虚报）")
         self.finish(ctx)
         if total <= 0:
             return TaskResult(True, "神器：等级都已最高或材料不足，本次没有升级",

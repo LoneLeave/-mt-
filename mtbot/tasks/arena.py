@@ -21,7 +21,6 @@ import re
 import time
 
 from .. import layout as L
-from .. import textocr
 from .. import log, textocr, vision
 from ..pages import MainCity
 from ..vision import State
@@ -158,7 +157,8 @@ class ArenaTask(BaseTask):
         return None
 
 
-    def _buy_one(self, ui, before_att: int | None = None, d0: int | None = None):
+    def _buy_one(self, ui, before_att: int | None = None, d0: int | None = None,
+                 ctx: TaskContext | None = None):
         """买 1 次挑战次数（钻石）。返回 (成功?, 花费钻石, 说明)。
 
         用户规则（2026-11-10）：钻石只允许用来买挑战次数 —— 这条路是允许的，
@@ -199,6 +199,11 @@ class ArenaTask(BaseTask):
             ui.press(L.ARENA_BUY_CANCEL, 200, label="arena_buy_cancel", expect="none")
             ui.wait(1.0)
             return False, 0, "弹窗里读不到「花费 N」，不敢点购买"
+        if ctx is not None and not self.may_spend(ctx, "角斗场买 1 次挑战次数", cost,
+                                                  kind="attempt"):
+            ui.press(L.ARENA_BUY_CANCEL, 200, label="arena_buy_cancel_gate", expect="none")
+            ui.wait(1.0)
+            return False, 0, f"弹窗写 {cost} 钻，预算/授权闸拒绝"
         if d0 is not None and cost > d0:
             # 2026-11-10：钻石不够时游戏只弹提示、按钮点了没反应，脚本却按买到了记账。
             ui.press(L.ARENA_BUY_CANCEL, 200, label="arena_buy_cancel_poor", expect="none")
@@ -242,11 +247,12 @@ class ArenaTask(BaseTask):
             if left == 0:
                 if buy_left > 0 and d0 is None:
                     log.info("  角斗场：主城钻石读数失败 → 不做任何买次数动作（无自证不花钻）")
-                elif buy_left > 0 and self.may_spend(ctx, "角斗场买 1 次挑战次数", None,
-                                                     kind="attempt"):
+                elif buy_left > 0:
                     ui.press(L.ARENA_BUY_PLUS, 200, label="arena_buy_plus", expect="none")
                     ui.wait(1.8)
-                    ok, spent, why = self._buy_one(ui, before_att=left, d0=d0)
+                    # 2026-11-20 审计 MAJOR：原来 may_spend 传 cost=None，预算闸永远放行。
+                    # 现在先把弹窗打开读到实价，在 _buy_one 里拿实价过闸。
+                    ok, spent, why = self._buy_one(ui, before_att=left, d0=d0, ctx=ctx)
                     log.info(f"  角斗场买次数：{why}")
                     if ok:
                         bought += spent

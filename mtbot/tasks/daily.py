@@ -18,6 +18,26 @@ from ..pages import (BountyPage, CampaignPage, DailyPage, ForgePage,
 from ..vision import State
 from .base import BaseTask, TaskContext, TaskResult
 
+def _cancel_dialog(ui, im, label: str) -> bool:
+    """点弹窗里的「取消」：先 OCR 找字，找不到才用固定点兜底。
+
+    2026-11-20 审计 M3：旧码两处直接点 (235, 1060)。弹窗高度一变就点空，
+    弹窗关不掉时下一条指令还可能落在金色「确定」上（= 花钻）。
+    """
+    try:
+        for t, c, _sc in textocr.read_lines(im, (80, 600, 660, 1150), min_score=0.45):
+            if "取消" in t.replace(" ", ""):
+                ui.press(c, 200, label=f"{label}_ocr", expect="none")
+                ui.wait(1.0)
+                return True
+    except Exception:      # noqa: BLE001
+        pass
+    log.info(f"  {label}：弹窗里读不到「取消」文字，用固定点兜底")
+    ui.press((235, 1060), 200, label=f"{label}_fb", expect="none")
+    ui.wait(1.0)
+    return False
+
+
 POPUP_CLOSE_BOTTOM = (360, 1228)
 
 
@@ -251,6 +271,11 @@ def _accept_high_rows(ui, info, accept_cost: int = 2000) -> None:
         return
     seen: list[str] = []
     for idx, y in enumerate(L.BOUNTY_ROWS, start=1):
+        # 2026-11-15：每一行动手前先确认没有残留的「是否消耗 ?N 加速…」钻石确认框。
+        # f42 21:36 就是这个框压着，下一行的「接受」坐标 (565,762) 正好落在金色
+        # 「加速」上，白扣 10 钻、日志只报一句「钻石少了对不上」。
+        if ui.dismiss_diamond_prompt():
+            log.info("  悬赏：先点掉残留的「消耗钻石加速」确认框，再继续看下一行")
         im = ui.screen("bounty_rows")
         q = bounty_quality(im, y)
         seen.append(q or "未识别")
@@ -388,8 +413,11 @@ def accept_bounties(ui, limit: int = 8, allow_refresh: bool = False,
                 log.info(f"  悬赏：这一刷要 {need} 钻，主城只有 {diamonds} 钻 → 不刷新"
                          f"（点了也不会有反应）")
                 break
-            if need is None and diamonds is None:
-                log.info("  悬赏：看不到刷新单价、也读不到主城钻石 → 不刷新（无自证不花钻）")
+            if need is None:
+                # 2026-11-20 审计 CRITICAL：原来只判「单价和钻石都读不到」才收手，
+                # 于是「单价读不到 + 主城钻石读得到」照样点刷新 = 不知价格就付款，
+                # 而且预算闸用的是 30 钻的估价。现在一律不刷。
+                log.info("  悬赏：读不到刷新单价 → 不刷新（不知价格就不花钻）")
                 break
             log.info(f"  悬赏：底栏是「{bar.strip()[:12]}」→ 这一刷要花 "
                      f"{need if need is not None else '?'} 钻（主城 {diamonds}，用户已授权）")
@@ -398,7 +426,7 @@ def accept_bounties(ui, limit: int = 8, allow_refresh: bool = False,
         ui.press(L.BOUNTY_REFRESH, 250, label="bounty_refresh", expect="none")
         ui.wait(2.6)
         after = ui.screen("bounty_refresh")
-        if vision.confirm_dialog(after):
+        if vision.dialog_confirm(after):
             # 2026-11-10：确认框要么是「是否花费 30 钻刷新」，要么是积分不足提示。
             # 先读正文：含「刷新」才确认（用户授权花钻），否则当作拦截、取消退出。
             txt = ""
@@ -417,13 +445,11 @@ def accept_bounties(ui, limit: int = 8, allow_refresh: bool = False,
                     after = ui.screen("bounty_refresh_ok")
                 else:
                     log.warn("  悬赏：刷新确认框里没找到金色「确定」，取消本次刷新")
-                    ui.press((235, 1060), 200, label="bounty_refresh_cancel", expect="none")
-                    ui.wait(1.0)
+                    _cancel_dialog(ui, after, "bounty_refresh_cancel")
                     break
             else:
                 log.info(f"  悬赏：刷新被拦（弹窗「{flat[:24] or '读不出文字'}」），不再刷新")
-                ui.press((235, 1060), 200, label="bounty_refresh_cancel2", expect="none")
-                ui.wait(1.0)
+                _cancel_dialog(ui, after, "bounty_refresh_cancel2")
                 break
         if vision.similar(before, after):
             log.warn("  悬赏：刷新按钮单次点击后画面没变（没点中），停止，不重试")
@@ -437,6 +463,16 @@ def accept_bounties(ui, limit: int = 8, allow_refresh: bool = False,
             info.setdefault("paid_cost", 0)
             info["paid_cost"] += int(need or 0)
         log.info(f"  悬赏：刷新 ×{info['refreshes']}（本次{'免费' if free else '花钻'}）")
+        if not free and diamonds is not None:
+            d_now = bounty_diamonds(after)
+            if d_now is None:
+                log.info("  悬赏：刷新后读不到主城钻石，这一刷没法对账，不再继续刷新")
+                break
+            if diamonds - d_now != int(need or 0):
+                log.warn(f"  悬赏：刷新弹窗写 {need} 钻，主城钻石实际 {diamonds}→{d_now}"
+                         f"（扣了 {diamonds - d_now}），停止继续刷新，收尾统一对账")
+                break
+            diamonds = d_now
         # 刷新后那一帧常常还在动画里 → 积分读成 None；重试 3 次再认
         pts2 = None
         for _ in range(3):
@@ -569,16 +605,28 @@ class QuickIdleTask(BaseTask):
         if vision.is_gold(im, *L.IDLE_CLAIM, r=16):
             ui.press(L.IDLE_CLAIM, 250)
             ui.wait(1.8)
+            # 2026-11-20 审计 C2：只凭「点之前是金钮」就记领取 = 假成功。
+            # 现在点完必须有证据：弹出奖励层（变暗/物品浮层）或金钮熄灭。
+            after_claim = ui.screen("idle_claim_after")
+            got = (vision.modal_dim(after_claim) or vision.item_popup(after_claim)
+                   or not vision.is_gold(after_claim, *L.IDLE_CLAIM, r=16))
             ui.press(L.IDLE_POPUP_BLANK, 150, expect="none")
             ui.wait(1.0)
-            claimed = 1
-            log.info("  挂机收益已领取")
+            if got:
+                claimed = 1
+                log.info("  挂机收益已领取（点后出了奖励层或金钮熄灭）")
+            else:
+                log.info("  挂机收益：点了「领取收益」画面没变化，不算领取")
         else:
             log.info("  没有可领取的挂机收益")
 
         # 2) 买快速挂机次数（「获取更多」金色时才能买）
         done = 0
-        free_left = 1
+        # 2026-11-20 审计 C1：这里原来是 free_left = 1（「默认还有免费次数」），
+        # OCR 读不到次数时该值保持 1 → need=0 → 预算闸与钻石对账整段被短路，
+        # 而按钮其实可能是金色付费钮，于是「真花钱记成免费成功」。现在默认 None
+        # （不知道就是不知道），免不免费只看按钮颜色：绿=免费、金=付费。
+        free_left = None
         spent = 0
         for _ in range(times):
             im = ui.screen("idle")
@@ -586,17 +634,34 @@ class QuickIdleTask(BaseTask):
             # 只有花钻买次数时才是金色。旧码只认金色，免费那次永远不点。
             free_btn = vision.is_green(im, *L.IDLE_MORE, r=16)
             paid_btn = vision.is_gold(im, *L.IDLE_MORE, r=16)
+            # 2026-11-18 03:18 空点 (235,1033)：今日剩余次数为 0 时「获取更多」是
+            # **灰掉的土黄**（真帧像素 (202,173,130)），旧码用 gold_bands_any 兜底
+            # 会把这条灰带当成金钮按下去 → diff=0.000 空点 + 4 个补偿点白赔 8s。
+            # 现在只认真金/真绿：金带必须质心本身 is_gold，否则不动手。
             if not (free_btn or paid_btn):
                 bands = vision.gold_bands_any(im, L.IDLE_MORE_BOX)
+                pt = None
                 if bands:
+                    pt = vision.gold_band_point(im, L.IDLE_MORE_BOX)
+                # 再加一道金色占比：真金按钮 gold_ratio ≥0.33（领取收益 0.477、
+                # 特权购买块 0.335），灰化土黄那条是 0.000。两道都过才敢按。
+                if pt is not None and vision.gold_ratio(im, L.IDLE_MORE_BOX) >= 0.25:
                     paid_btn = True
                 else:
+                    log.info("  快速挂机：「获取更多」现在是灰的（今日剩余次数 0），不点")
                     break
             if textocr.available():
-                m = re.search(r"免费次数[:：]\s*(\d+)", textocr.read_text(im, L.IDLE_FREE_TEXT))
+                m = re.search(r"(?:免费|今日剩余)?次数[:：]?\s*(\d+)",
+                              textocr.read_text(im, L.IDLE_FREE_TEXT))
                 if m:
                     free_left = int(m.group(1))
-            need = 0 if free_left > 0 else (50 if done == 1 else 100)
+            if free_left is not None and free_left <= 0 and not paid_btn:
+                log.info("  快速挂机：今日剩余次数 0（按钮灰化），今天不买了")
+                break
+            if free_btn and not paid_btn:
+                need = 0                      # 绿色 = 真免费，不涉及钻石
+            else:
+                need = 50 if done == 0 else 100   # 金色 = 付费，按游戏标价记账
             # 2026-11-03 用户反馈「用钻石买刷怪次数被乱用」：付费次数一律走全局闸门，
             # runtime.allow_diamonds=false（默认）时直接停，不再靠 diamond_budget 兜底。
             # 两道闸：先看单任务预算（第 251 行 budget），再走全局 allow_diamonds 开关。
@@ -623,9 +688,9 @@ class QuickIdleTask(BaseTask):
                     break
                 log.info(f"  快速挂机：钻石 {d0} → {d1}（-{need}），确认真的买到了")
             done += 1
-            if free_left:
+            if free_left is not None and free_left > 0:
                 free_left -= 1
-            else:
+            elif need:
                 spent += need
             log.info(f"  快速挂机 {done}（累计 {spent} 钻）")
 
@@ -1034,12 +1099,16 @@ class CampaignTask(BaseTask):
         locked = False
         defeat = False
         engaged = False
+        # 2026-11-19 假成功审计 C1：进过布阵页 ≠ 打过一场。点「战斗」本身
+        # 只要求 expect="none"（不校验画面），所以这里先记 pending，等真的
+        # 看到战斗帧或结算页再把 pending 结算成 fought。
+        pending = 0
         last_action = ""
         stage_tries = 0
         stage_dialog = 0      # 「下一章」切换时的过渡弹窗，第一次不当成等级封锁
         block_reason = ""    # 被游戏明说挡住时的原话（如「角斗券已达上限」）
         for _ in range(max(12, max_fights * 6)):
-            if fought >= max_fights:
+            if fought + pending >= max_fights:
                 log.info(f"  主线达到本次场次上限（{max_fights} 场）")
                 break
             im = ui.screen("camp_map")
@@ -1075,6 +1144,11 @@ class CampaignTask(BaseTask):
                     ui.wait(0.6)
                     continue
             st = vision.classify(im)
+            if st in (State.BATTLE, State.RESULT_DEFEAT, State.RESULT_TOWER,
+                      State.RESULT_TREE, State.RESULT_GENERIC, State.RESULT_LEGEND):
+                if pending:
+                    fought += pending
+                    pending = 0
             if st == State.RESULT_DEFEAT:
                 defeat = True
                 ui.press(L.BLANK, 150, expect="none")
@@ -1096,10 +1170,11 @@ class CampaignTask(BaseTask):
                 continue
             if st == State.DEPLOY:
                 if not engaged:
-                    fought += 1
+                    # 先记「待结算」，看到战斗/结算页才变成一次挑战
+                    pending += 1
                     engaged = True
                     stage_tries = 0
-                    log.info(f"  主线挑战 {fought} 次")
+                    log.info(f"  主线第 {fought + pending} 次进布阵页（等战斗画面确认）")
                 ui.press(L.DEPLOY, 200, expect="none")
                 ui.wait(1.0)
                 ui.press(L.FIGHT, 200, label="fight", expect="none")
@@ -1197,6 +1272,9 @@ class CampaignTask(BaseTask):
             state = "等级未解锁"
         else:
             state = "战斗失败" if defeat else "已尽力"
+        if pending:
+            log.info(f"  主线：还有 {pending} 次进了布阵页但没看到战斗/结算，不计入")
         return TaskResult(True,
                           f"主线挑战 {fought} 次（{state}）、关卡奖励 {rewards}、接悬赏 {b['accepted']}",
-                          {"fights": fought, "rewards": rewards, "bounties": b["accepted"]})
+                          {"fights": fought, "rewards": rewards, "bounties": b["accepted"],
+                           "unconfirmed": pending})

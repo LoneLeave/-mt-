@@ -63,9 +63,13 @@ class DungeonTask(BaseTask):
                 return "win"
             if st in (State.RESULT_TOWER, State.RESULT_TREE, State.RESULT_GENERIC,
                       State.RESULT_LEGEND):
+                # 2026-11-19 审计：这里原来只要「是某个结算态」就 return "win"，
+                # 而走到这一行时 victory_banner 已经判过是 False —— 等于把认不出
+                # 胜负的结算页一律记成通关。改成如实报 unknown：不记通关、不记失败。
                 ui.press((370, 1130), 220)
                 ui.wait(2.2)
-                return "win"
+                log.info("  日常副本：结算页认不出「胜利」横幅（形态变了），这一层不按通关计")
+                return "unknown"
             # 2026-11-09：胜利页「确定」(360,1050) 与失败页「确定」(360,1060) 几乎同一点，
             # 单看金色会把战败记成胜利；实测 23 张结算帧 victory_banner 与胜负 100% 一致。
             if vision.victory_banner(im) and vision.is_gold(im, *self.VICTORY_OK, r=16):
@@ -93,6 +97,10 @@ class DungeonTask(BaseTask):
                 if st in (State.DIALOG, State.MAIN_CITY_DIM):
                     ui.close_popup()
                 log.info("  日常副本：挑战没进布阵页（次数或等级限制），停止推进")
+                # 2026-11-18 第 44 轮实测：这一下没进布阵页就不会自动回列表，
+                # 后面的「扫荡/宝箱/切页签」全落在别的页面上（3 条 WARN）。
+                # 收手前先把页面拉回副本列表页，后续步骤才有着落点。
+                page.ensure_page()
                 return wins, False
             ui.press(L.DEPLOY, 200, expect="none")
             ui.wait(1.0)
@@ -107,6 +115,13 @@ class DungeonTask(BaseTask):
                 ui.wait(1.0)
             # 2026-11-08：轮询式跳过，2~4 秒进结算，不再白等 8 秒
             ui.battle_finish(label="dun_skip", timeout=14.0)
+            if not getattr(ui, "battle_started", True):
+                # 2026-11-19 审计 B2：14s 内一次战斗画面都没见到 = 这场没打起来。
+                # 回列表页并按「没打成」处理，别把布阵页当成结算页去点扫荡/宝箱。
+                log.info("  日常副本：这一层没进战斗画面（次数/等级限制或加载慢），"
+                         "回副本列表页、不按已打处理")
+                page.ensure_page()
+                return wins, False
             ui.wait(1.8)
             r = self._result(ui)
             if r == "none":
@@ -116,6 +131,14 @@ class DungeonTask(BaseTask):
                 ui.wait(1.2)
                 r = self._result(ui)
             if r != "win":
+                if r == "unknown":
+                    # 结算页认不出胜负：不记通关也不记失败，交给后面的扫荡兜底。
+                    log.info(f"  日常副本：第 {wins + 1} 层结算页认不出胜负，改用扫荡")
+                    if not page.at_page():
+                        ui.handle_interruptions()
+                        if not page.at_page():
+                            page.ensure_page(tries=2)
+                    return wins, False
                 if r == "none":
                     # 2026-11-07：跳过没生效/还在打时也会走到这里，别说成「没打赢」
                     log.info(f"  日常副本：第 {wins + 1} 层没结算出来（跳过没生效或战斗还在打），改用扫荡")
@@ -186,7 +209,7 @@ class DungeonTask(BaseTask):
             if "扫荡" not in flat or not m:
                 log.info(f"  日常副本：点付费扫荡后没看到「是否花费 N…扫荡」弹窗"
                          f"（OCR：{flat[:24] or '空'}），不确认")
-                if vision.confirm_dialog(dlg):
+                if vision.dialog_confirm(dlg):
                     ui.press(L.DUNGEON_SWEEP_DLG_CANCEL, 200,
                              label="dun_paid_cancel", expect="none")
                 break
